@@ -971,11 +971,20 @@ def _homr_run_root() -> pathlib.Path:
     return root
 
 
-def to_musicxml_homr(image_path, outdir=None, timeout=420, on_step=None):
+# homr --debug 会把「它认出来的音符」画回原图（绿/蓝框）。最近一次的结果记在这，
+# 给前端做「看它到底认到了哪」用：漏音的地方一眼就能看见，比只看输出谱强。
+LAST_DEBUG = {"notes": None, "all": []}
+
+
+def to_musicxml_homr(image_path, outdir=None, timeout=420, on_step=None,
+                     keep_debug=False):
     """图片 → MusicXML（用 homr）。
 
     homr 只会把 xml 写在图片旁边，所以先把图复制成纯 ascii 名字（它用
     cv2.imread 读图，中文路径会失败），跑完再搬回来。
+
+    keep_debug=True 时额外要一张「识别结果叠在原图上」的图（--debug 产出的
+    `*_notes.png`），路径写进 `LAST_DEBUG["notes"]`，并且拷到 outdir 里。
     """
     exe = find_homr()
     if not exe:
@@ -1005,10 +1014,34 @@ def to_musicxml_homr(image_path, outdir=None, timeout=420, on_step=None):
             shutil.copyfile(src, work)
         step("homr 识别中", {})
         t0 = time.time()
-        proc = subprocess.run([str(exe), str(work)], capture_output=True,
+        # homr 自带的 --debug 会把每个音标成 `note12` 压在谱面上，密到看不清。
+        # 走 tools/homr_overlay.py（同一个 venv 的 python 跑）：它先把画法换成
+        # 「只画音符头的小圈」，再调 homr，出的叠图干净、能直接给用户看。
+        overlay_py = pathlib.Path(__file__).resolve().parent / "tools" / "homr_overlay.py"
+        venv_py = pathlib.Path(str(exe)).parent / "python.exe"
+        use_overlay = keep_debug and overlay_py.exists() and venv_py.exists()
+        if use_overlay:
+            cmd = [str(venv_py), str(overlay_py), str(work)]
+        else:
+            cmd = [str(exe), str(work)] + (["--debug"] if keep_debug else [])
+        proc = subprocess.run(cmd, capture_output=True,
                               text=True, timeout=timeout, cwd=str(td),
                               encoding="utf-8", errors="replace")
         dt = time.time() - t0
+        LAST_DEBUG["notes"] = None
+        LAST_DEBUG["all"] = []
+        if keep_debug:
+            # `write_all_bounding_boxes_alternating_colors("notes", ...)` 落成
+            # `page_debug_<n>_notes.png`，是全部认出来的音符（含符干位置）。
+            found = sorted(td.glob("*notes*.png"))
+            LAST_DEBUG["all"] = [str(p) for p in sorted(td.glob("*_debug_*.png"))]
+            if found:
+                dst_dbg = outdir / (src.stem + "_homr_notes.png")
+                try:
+                    shutil.copyfile(found[-1], dst_dbg)
+                    LAST_DEBUG["notes"] = str(dst_dbg)
+                except OSError:
+                    pass
         made = sorted(td.glob("*.musicxml"))
         if not made:
             raise RuntimeError(
@@ -1065,7 +1098,8 @@ def score_musicxml(path) -> dict:
 
 
 def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
-                     scorer=None, on_step=None, engines=("homr",), **kw):
+                     scorer=None, on_step=None, engines=("homr",),
+                     keep_debug=False, **kw):
     """图片 → MusicXML，多个引擎/多个放大倍数都跑一遍，取最好的那份。
 
     默认只用 homr（2026-10-23 用户定的：只留 homr，Audiveris 从识别流程里撤掉）。
@@ -1126,7 +1160,10 @@ def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
 
     if "homr" in engines:
         _try("homr", "homr",
-             lambda: to_musicxml_homr(src, outdir / "s_homr", on_step=step))
+             lambda: to_musicxml_homr(src, outdir / "s_homr", on_step=step,
+                                      keep_debug=keep_debug))
+        if best is not None and best.get("engine") == "homr" and LAST_DEBUG["notes"]:
+            best["debug_notes"] = LAST_DEBUG["notes"]
 
     # homr 读得很干净就直接交卷，不再花 30~40 秒把 Audiveris 跑四遍。
     # 判据：覆盖率 ≥99.5% 且起音速率在 1.5~8/s（速率过低是被拉伸，过高是虚音）。
