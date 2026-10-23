@@ -379,7 +379,7 @@
     var b = $('#opt-backend').value;
     if (b) q.set('backend', b);
     q.set('chords', $('#opt-chords').value);
-    q.set('harmony', $('#opt-chords').value === 'off' ? '0' : '1');
+    q.set('harmony', '1');
     q.set('max_notes', $('#opt-maxnotes').value || '3');
     var rb = $('#opt-rubato');
     if (rb && rb.value) q.set('rubato', rb.value);
@@ -937,7 +937,7 @@
       if (t && S.tempoDirty) body.tempo = Number(t);
       var chords = $('#tune-chords').value;
       body.chords = chords;
-      body.harmony = chords !== 'off';
+      body.harmony = true;
       body.max_notes = Number($('#tune-maxnotes').value || 3);
       var _o = $('#tune-octave');
       if (_o) body.octave = _o.value;
@@ -1190,7 +1190,7 @@
     bits.push($('#opt-tempo').value ? ('速度 ' + $('#opt-tempo').value) : '自动测速');
     bits.push($('#opt-key').value ? (KEY_LABEL[$('#opt-key').value] || $('#opt-key').value) : '自动定调');
     var chords = $('#opt-chords').value;
-    bits.push(chords === 'off' ? '只留主旋律' : chords === 'on' ? '每格加和弦' : '和弦自动');
+    bits.push(chords === 'duo' ? '和弦双音' : '和弦自动');
     var b = $('#opt-backend').value;
     if (b) bits.push(backendName(b));
     $('#panel-summary').textContent = bits.join(' · ');

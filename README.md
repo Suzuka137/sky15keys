@@ -24,6 +24,10 @@
 > 图片这条路是本地自动识谱（开源 [homr](https://github.com/liebharc/homr)，CPU 跑，一页 5~9 秒），
 > 识出来的谱再**先弹成钢琴音频过一遍转谱模型**，识谱漏掉的音会在这一步被听回来。
 > 图片**只认五线谱**：简谱、光遇 15 键格子谱、照片里的别的东西，一律不转——传上去会直接告诉你原因。
+>
+> 顺带提一句：**看图这条路还算半成品**，准不准很吃图片。扫描的、正对着拍的还行；
+> 手机随手拍、拍歪了、有阴影的，会漏音，偶尔连拍号都读错。要稳就走音频或 MusicXML，
+> 那两条路是反复标定过的。
 
 只依赖 Python 与公开模型，不含任何第三方曲谱数据。界面上那 48 个音色是
 从 [Salamander Grand Piano](https://archive.org/details/SalamanderGrandPianoV3)（CC-BY 3.0）
@@ -37,6 +41,9 @@
 > key 80/80. Backend is Transkun 2.0 (MIT, weights bundled in its pip package, CPU-only works).
 > Note: recordings, MusicXML and staff-notation images/PDFs all work; images are read with
 > local OMR (homr) and replayed as piano audio before transcription.
+> The image path is still a work in progress: it is fussy about the picture — clean scans are
+> fine, casual phone photos with skew or shadow can drop notes or misread the time signature.
+> For dependable results use audio or MusicXML.
 > See `CONTRIBUTING.md` if you want to help.
 
 ## 安装
@@ -92,7 +99,9 @@ python -m sky15 omr   五线谱.jpg  -o 出.smc            # 五线谱图片/PDF
 - **能下载钢琴声 MP3**：五线谱来的弹原谱的每一个音（不压缩成 15 键），识谱漏音的地方自动连奏补洞；
   音频来的弹屏幕上这份 15 键谱
 - 顺手能给成品改名（标题和谱面里的 `曲名:[...]` 一起改）
-- 参数随时改随时重排：速度（可点候选值）、每格音数、只留主旋律、左右手是否分开、音区
+- 参数随时改随时重排：速度（可点候选值）、和弦（自动 / 双音）、每格音数、左右手是否分开、音区
+- **和弦双音**：只给「一个高音 + 一个低音」的格子补第三音，补的音只用低音区那七个，
+  主旋律不动；补完会撞上 `12 23 34 45 67 17 27 16 26` 的格子自动跳过
 - 音区三档（`--octave`）：`off` 不动（听到什么写什么）／`auto` 自动（整首偏低时唱名抬一层、
   标 `(8vb)`，发声不变，这是现成 15 键谱里最常见的写法）／`mel` 只抬旋律（旋律进高音行、
   发声真高 12 半音）。想跟现成的谱子长得像就选 `auto`

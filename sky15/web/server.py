@@ -193,6 +193,18 @@ def _bool(v, default=True):
     return default
 
 
+def _chord_mode(v):
+    """调参里的「和弦」开关：`auto` 原样 / `duo` 双音。
+
+    双音 = 只给「一个高音 + 一个低音」的格子补一个低音区的和弦音，
+    具体怎么挑在 `arrange._chord_density` 里（含禁配表）。
+    """
+    s = str(v or "").strip().lower()
+    if s in ("duo", "2", "double", "双音", "两音", "加和弦"):
+        return "duo"
+    return "auto"
+
+
 def _pretty_title(name: str) -> str:
     """文件名 → 曲名：去扩展名、去下划线/连字符堆、去掉常见的机器后缀。"""
     stem = os.path.splitext(os.path.basename(name or ""))[0]
@@ -427,15 +439,29 @@ def _tempo_note(parsed, tempo, time_sig=None):
     """结果芯片上那句"速度是怎么定的"——给用户看，不要贴整张速度表。
 
     谱子里没写速度时 MusicXML 没速度可依，`parse_full` 会退回 100 BPM，
-    这时明说"谱面没写速度，按 100 走"，用户才知道该不该手填。
+    这时明说"没标速度、按默认走"，用户才知道该不该手填。
+
+    注意：这里说的都是**谱面上四分音符的速度**，不是成谱速度。成谱速度要按
+    拍号换算（`_grid_tempo`），所以调用方还会用 `_grid_tail` 补一句结论，
+    否则 4/4 的谱会只剩一个 "100 BPM"，看起来像没生效。
     """
     tm = list(getattr(parsed, "tempo_map", []) or [])
     found = bool(getattr(parsed, "tempo_found", True))
     if len(tm) > 1:
         return f"变速 {len(tm)} 段（{tempo} BPM 起）"
     if found:
-        return f"谱面自带 {tempo} BPM"
-    return f"谱面没写速度，按 {tempo} BPM"
+        return f"谱面标 {tempo} BPM"
+    return f"谱面没标速度，按默认 {tempo} BPM 读谱（不对就手填）"
+
+
+def _grid_tail(tempo, grid, time_sig):
+    """把"谱面速度 → 成谱速度"这一步写在芯片上，免得用户以为没换算。"""
+    g = int(round(grid))
+    bq = _bar_quarters(time_sig)
+    if abs(grid - tempo) < 0.5:
+        return f" · {time_sig} 一小节 8 格 → 成谱 {g} BPM"
+    return (f" · {time_sig} 一小节 {bq:g} 拍要铺 8 格 → 成谱 {g} BPM"
+            f"（谱面 {tempo} 是四分音符算的）")
 
 
 def _build_result(jid: str, text: str, *, kind: str, backend: str = "",
@@ -809,7 +835,8 @@ def do_rearrange(job, p: dict) -> dict:
                   else "mel" if octv in ("mel", "melody", "只抬旋律", "2")
                   else "off" if octv in ("off", "none", "0")
                   else "auto")
-    hs = {"on": True, "off": False}.get(chords, "auto")
+    hs = "auto"                       # 左右手自动分，开关交给 chord_mode
+    chord_mode = _chord_mode(chords)
     title = (p.get("title") or prev.get("title") or "未命名").strip() or "未命名"
 
     conf, grid, doubled, hit = "手动", "", 0, 1.0
@@ -860,7 +887,7 @@ def do_rearrange(job, p: dict) -> dict:
     tempo = int(_clamp(int(tempo or 120), 20, 400))
     text = A.arrange(events, tempo=tempo, time_sig=time_sig, key=key, title=title,
                      offset=phase, warp=warp, harmony=harmony, max_notes=max_notes,
-                     hand_split=hs, octave_fit=octave_fit)
+                     hand_split=hs, chord_mode=chord_mode, octave_fit=octave_fit)
     params = {"tempo": tempo, "key": key or "", "harmony": harmony,
               "max_notes": max_notes, "chords": chords, "octave": octv,
               "backend": prev.get("backend") or ""}
@@ -906,7 +933,14 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
         tempo, phase, why = float(fixed_tempo), 0.0, {}
         hit, conf, doubled = 1.0, "谱面", 0
         grid = fixed_note or f"按谱面速度 {int(round(tempo))} BPM · {ts}"
-        job["_cache"] = {"timebase": "sec", "events": events, "time_sig": ts}
+        # 把"谱面速度"当成这首歌的自动值存进 cache：用户在调参里点「恢复自动测速」
+        # 时会走 do_rearrange 的 auto 分支，如果不存这一条，就会拿音频重新猜一遍
+        # （实测 4/4 谱的 100 被猜成 199，用户看到的就是"点一下速度就变了"）。
+        job["_cache"] = {"timebase": "sec", "events": events, "time_sig": ts,
+                         "from_sheet": True,
+                         "auto": {"tempo": int(round(tempo)), "phase": 0.0,
+                                  "hit": 1.0, "conf": "谱面", "grid": grid,
+                                  "doubled": 0}}
         _stage(job, "tempo", 1.0)
         _ck(job)
         job["params"] = dict(opts, tempo=int(round(tempo)), key=(opts.get("key") or ""),
@@ -918,8 +952,7 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
                          title=_pretty_title(job.get("name") or ""), offset=0.0,
                          harmony=_bool(opts.get("harmony"), True),
                          max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
-                         hand_split={"on": True, "off": False}.get(
-                             (opts.get("chords") or "auto").lower(), "auto"),
+                         hand_split="auto", chord_mode=_chord_mode(opts.get("chords")),
                          octave_fit=(lambda o: "force" if o in ("high", "up", "+12", "高八度", "1")
                                      else "mel" if o in ("mel", "melody", "只抬旋律", "2")
                                      else "off" if o in ("off", "none", "0")
@@ -995,8 +1028,7 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
                      title=_pretty_title(job.get("name") or ""), offset=phase,
                      harmony=_bool(opts.get("harmony"), True),
                      max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
-                     hand_split={"on": True, "off": False}.get(
-                         (opts.get("chords") or "auto").lower(), "auto"),
+                     hand_split="auto", chord_mode=_chord_mode(opts.get("chords")),
                      octave_fit=(lambda o: "force" if o in ("high", "up", "+12", "高八度", "1")
                                  else "mel" if o in ("mel", "melody", "只抬旋律", "2")
                                  else "off" if o in ("off", "none", "0")
@@ -1176,9 +1208,7 @@ def _run_score(job):
         tempo_grid = _grid_tempo(tempo, time_sig)
         secs = parsed.to_seconds()
         grid_note = _tempo_note(parsed, tempo)
-        if abs(tempo_grid - tempo) > 0.5:
-            # 2/4、3/4、6/8… 一小节不是 8 个八分音符，得把速度折算成"一格 8 分"的速度
-            grid_note += (f" · {time_sig} 一小节 8 格 → {int(round(tempo_grid))} BPM")
+        grid_note += _grid_tail(tempo, tempo_grid, time_sig)
         # 谱面自己写了变速（渐快/渐慢/换段）时，秒已经按分段速度积分过，
         # 而格子只有一个固定 tempo —— 直接喂进去，变速段的音会被抖到格子外。
         # 这里把「秒 → 拍」反推回来除以 0.5 当 warp，格子就跟着谱面的速度走。
@@ -1235,8 +1265,7 @@ def _run_score(job):
                      warp=warp,
                      harmony=_bool(opts.get("harmony"), True),
                      max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
-                     hand_split={"on": True, "off": False}.get(
-                         (opts.get("chords") or "auto").lower(), "auto"))
+                     hand_split="auto", chord_mode=_chord_mode(opts.get("chords")))
     job["_cache"] = {"timebase": "beats", "events": events, "tempo": tempo,
                      "time_sig": time_sig,
                      "tempo_map": list(getattr(parsed, "tempo_map", None) or [])}
@@ -1271,9 +1300,17 @@ def _run_omr(job):
         # Audiveris 按几档放大跑一遍取最优。Audiveris 对分辨率不是「越大越好」，
         # 实测同一页 1× 出 317 音/覆盖 99.5%，2× 只剩 231 音/覆盖 71.6%。
         _stage(job, "omr", 0.15, note="选引擎")
-        made, omr_best = OM.to_musicxml_best(
-            path, keep_debug=True,
-            on_step=lambda msg, info: _stage(job, "omr", 0.3, note=msg))
+        _best_args = dict(keep_debug=True,
+                          on_step=lambda msg, info: _stage(job, "omr", 0.3, note=msg))
+        try:
+            made, omr_best = OM.to_musicxml_best(path, **_best_args)
+        except Exception as first:
+            # homr 偶尔会失败一次（进程/临时目录竞争），同一张图第二次就好了。
+            # 实测用户上传《一梦繁唐》第一次报「这张图不是五线谱」，重传立刻 230 音。
+            # 所以崩了先自己重跑一遍，别把引擎的偶发故障说成"你的图不是五线谱"。
+            log(f"识谱第一次失败，重试一次：{first}")
+            _stage(job, "omr", 0.15, note="重试")
+            made, omr_best = OM.to_musicxml_best(path, **_best_args)
     except Exception as e:
         tail = str(e).strip().splitlines()
         tail = next((x for x in reversed(tail) if x.strip()), "")
@@ -1352,8 +1389,7 @@ def _run_omr(job):
         tempo_grid = _grid_tempo(tempo, time_sig)
         secs = parsed.to_seconds()
         grid_note = _tempo_note(parsed, tempo)
-        if abs(tempo_grid - tempo) > 0.5:
-            grid_note += (f" · {time_sig} 一小节 8 格 → {int(round(tempo_grid))} BPM")
+        grid_note += _grid_tail(tempo, tempo_grid, time_sig)
         tmap = list(getattr(parsed, "tempo_map", None) or [])
         if len({round(float(b), 3) for _p, b in tmap}) > 1:
             try:
@@ -1385,17 +1421,22 @@ def _run_omr(job):
     best = job.get("_omr_best") or {}
     _eng = {"homr": "homr", "audiveris": "Audiveris"}.get(best.get("engine"), "")
     _n = len(best.get("tries") or [])
+    _eng_note = ""
+    grid_base = grid_note          # 不带"识谱 homr"的那半句，_arrange_from_events 自己会接
     if _eng:
-        grid_note += f" · 识谱 {_eng}" + (f"（{_n} 档取最优）" if _n > 1 else "")
+        _eng_note = f" · 识谱 {_eng}" + (f"（{_n} 档取最优）" if _n > 1 else "")
+        grid_note += _eng_note
 
     # 同 _run_score：默认先弹成钢琴音频再转谱。识谱读出来的钢琴谱同时音最多
     # 9 个，15 键一格只放得下 3 个，直排等于硬砍；过一遍模型会按听感挑音。
     if _bool(opts.get("via_audio"), True):
         try:
             ev2, _bk = _sheet_to_audio_events(job, secs)
-            job["_omr_note"] = grid_note
+            # 下面 _arrange_from_events 会自己接"· 先弹钢琴音频再转谱 · <_omr_note>"，
+            # 所以这里只把"识谱某某"这一节交给它，否则整句会重复一遍。
+            job["_omr_note"] = _eng_note.lstrip(" ·")
             return _arrange_from_events(job, ev2, opts, backend_name=_bk,
-                                        fixed_tempo=tempo, fixed_ts=time_sig, fixed_note=grid_note)
+                                        fixed_tempo=tempo, fixed_ts=time_sig, fixed_note=grid_base)
         except Exception as exc:
             log(f"谱面→钢琴音频这条路失败，回退直排：{exc}")
             job["_via_audio"] = {"fallback": f"{type(exc).__name__}: {exc}"[:160]}
@@ -1405,8 +1446,7 @@ def _run_omr(job):
                      warp=warp,
                      harmony=_bool(opts.get("harmony"), True),
                      max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
-                     hand_split={"on": True, "off": False}.get(
-                         (opts.get("chords") or "auto").lower(), "auto"))
+                     hand_split="auto", chord_mode=_chord_mode(opts.get("chords")))
     job["_cache"] = {"timebase": "beats", "events": events, "tempo": tempo,
                      "time_sig": time_sig,
                      "tempo_map": list(getattr(parsed, "tempo_map", None) or [])}

@@ -72,7 +72,7 @@
   <section id="panel" class="panel" aria-label="转谱设置">
     <button id="panel-toggle" class="panel-head" aria-expanded="true">
       <span class="ph-title">转谱设置</span>
-      <span id="panel-summary" class="ph-sum">自动测速 · 自动定调 · 加左手和弦</span>
+      <span id="panel-summary" class="ph-sum">自动测速 · 自动定调 · 和弦自动</span>
       <svg class="ph-chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
     </button>
     <div id="panel-body" class="panel-body">
@@ -97,13 +97,12 @@
         <span class="hint">用手机录/游戏里放的音，选自动或 Transkun；自己合成的钢琴 MIDI 转音频可选钢琴模型</span>
       </label>
       <label class="field">
-        <span class="lbl">左手和弦</span>
+        <span class="lbl">和弦</span>
         <select id="opt-chords">
-          <option value="auto">自动判断</option>
-          <option value="on">每格都加</option>
-          <option value="off">只留主旋律</option>
+          <option value="auto">自动（听到几个写几个）</option>
+          <option value="duo">双音（一高一低再补一个低音）</option>
         </select>
-        <span class="hint">在光遇里单手弹选「只留主旋律」</span>
+        <span class="hint">双音只给「一个高音＋一个低音」的格子补第三音，主旋律不动</span>
       </label>
       <label class="field">
         <span class="lbl">每格最多几个音</span>
@@ -224,11 +223,10 @@
               <input id="tune-tempo" type="number" inputmode="numeric" min="20" max="400">
             </label>
             <label class="field tight">
-              <span class="lbl">左手和弦</span>
+              <span class="lbl">和弦</span>
               <select id="tune-chords">
-                <option value="auto">自动判断</option>
-                <option value="on">每格都加</option>
-                <option value="off">只留主旋律</option>
+                <option value="auto">自动</option>
+                <option value="duo">双音</option>
               </select>
             </label>
             <label class="field tight">

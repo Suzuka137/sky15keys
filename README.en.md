@@ -30,6 +30,11 @@ whole set; tempo correct 76/80, key correct 80/80.**
 > page) and then **replays the recognised score as piano audio before transcribing**, so notes
 > the OMR missed are heard back at that stage. Images must be **staff notation**: numbered
 > (jianpu) notation, 15-key game screenshots and ordinary photos are refused with a clear reason.
+>
+> One heads-up: **the image path is still a work in progress**. It is fussy about the picture —
+> clean scans read fine, but casual phone photos that are skewed or shadowed can drop notes and
+> sometimes misread the time signature. For dependable output use audio or MusicXML; those two
+> are the calibrated paths.
 
 It depends only on Python and public models, and contains no third-party score data. The
 48 instrument samples in the web UI are synthesised at build time from
@@ -96,7 +101,10 @@ Web UI: `python -m sky15.web.server` (or double-click `sky15/web/start-ui.bat`),
   play the 15-key version on screen
 - Rename the result — both the title and `曲名:[...]` inside the sheet change
 - Change parameters and re-arrange without re-transcribing: tempo (candidate values are one
-  click away), notes per slot, melody only, separate the hands, register
+  click away), chords (auto / duo), notes per slot, separate the hands, register
+- **Duo chords**: a slot that already holds one high note plus one low note gets a third note,
+  picked only from the seven low-register tones, so the melody never moves; slots where every
+  candidate would form `12 23 34 45 67 17 27 16 26` are left alone
 - Register (`--octave`): `off` writes what you hear / `auto` shifts the notation up a level
   and marks `(8vb)` when the whole piece sits low, leaving the sound unchanged (the most
   common convention in existing 15-key sheets) / `mel` lifts only the melody, sounding a real
