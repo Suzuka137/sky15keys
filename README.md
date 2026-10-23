@@ -1,47 +1,35 @@
-# sky15 — 音频 / 五线谱 → 光遇 15 键乐谱
+# sky15 — 钢琴录音 / 五线谱 → 光遇 15 键乐谱
 
-把一段钢琴音频或一份 MusicXML 五线谱，转成《Sky 光遇》那种 15 键乐器的乐谱文本
-（8 个格 = 一小节，最多 3 个音同时按）。
+把一段钢琴录音（手机录的、游戏里放的、视频里扒的）丢进去，转成《Sky 光遇》那种
+15 键乐器的乐谱文本——**8 个格 = 一小节，每格最多 3 个音同时按**，和游戏里的键位一一对应。
 
-> ## ⚠️ 五线谱识别（拍照 / PDF / 截图）是半成品，不好用
->
-> **先说清楚：只有音频转谱是能用的。** 拿图片去识谱这一块我没做好，请别指望它。
->
-> 具体差在哪（实测，不是感觉）：
->
-> - 识谱这一步靠开源的 [Audiveris](https://github.com/Audiveris/audiveris)，它自己就要装
->   一个 300+ MB 的 Java 程序；多数图片要先放大 2 倍它才认得准，一页要 15 秒。
-> - 认出来的音里，同一时刻经常挤着 4~9 个音（正常钢琴谱最多也就 5 个），而 15 键
->   **每格最多按 3 个音**，为了塞进去必须砍音：1× 识别要砍掉 **20.4%** 的音，
->   放大 2× 也要砍 **9.3%**。被砍掉的就是你听到的"漏音 / 走味"。
-> - 源谱的音真正落到 15 键上只有 **约 78%**（2× 时 89%）；准确率倒是 100%
->   （宁可少写也不写错音）。
-> - 拍号/调号识别也会错（有份 2/4 的谱被读成 3/4），反复、D.C.、装饰音这些符号
->   处理得不完整。
->
-> **结论**：想要好结果，请走 MusicXML（MuseScore、Sibelius、Finale、Dorico 都能导出，
-> 网上买的正版电子谱通常是 .mxl）。**只有图片的话，这个功能能给你一份"能弹但明显不如
-> 人工"的草稿，不要期待成品。** 这条限制我不打算假装它不存在。
->
-> 音频转谱那边是另一回事：干净钢琴录音实测 **95%**，正常手机录的钢琴也在这个量级。
+速度、调性、左右手全自动判定，不用你填任何参数。转完能直接听、能导出 MIDI、
+能存成谱面长图 / 分页图 / PDF，也能在网页上的 15 键面板里按键弹。
+
+自己也有一套引擎（原版音频合成器），所以这条路对得上：**自建 80 首基准，干净录音 F1 95.1，
+全库均值 92.0，速度自动判对 76/80，调性 80/80。**
+
+- 输入：`.mp3` `.m4a` `.wav` `.flac` 视频文件、`.mid`、`.musicxml`/`.mxl`、已有的 `.smc`
+- 输出：`.smc` 乐谱、MIDI、PNG 长图 / 分页图、PDF
+- 后端：Transkun 2.0（MIT，权重随 pip 包走，装完即用；没有显卡也能跑，CPU 一首约 1 分钟）
+- 界面：Python 标准库起服务，没有框架依赖，双击 `web/start-ui.bat` 就能用
+
+> 一句话说清边界：**音频转谱这条路是能用的；把五线谱"照片"认成谱（图片识谱）还是半成品**，
+> 具体差在哪写在下面「已知限制」里。要转五线谱请优先用 MusicXML（MuseScore、Sibelius、
+> Finale、Dorico 都能导出，买的正版电子谱通常是 `.mxl`）。
 
 只依赖 Python 与公开模型，不含任何第三方曲谱数据。界面上那 48 个音色是
 从 [Salamander Grand Piano](https://archive.org/details/SalamanderGrandPianoV3)（CC-BY 3.0）
 实时合成的，随仓库分发合法，和游戏里的原声音无关。
 
-> **English (short):** sky15 turns piano audio or MusicXML into sheet text for 15-key
-> instruments like Sky: Children of the Light (8 slots per bar, ≤3 simultaneous notes per
-> slot). It transcribes with Transkun 2.0, estimates tempo/key itself, arranges
-> melody + bass under the 3-note constraint, and can render back to audio, PNG and PDF.
-> On our own 80-song set it reproduces ~95% of the notes of the reference arrangement.
-> The Transkun weights ship inside its pip package, so installation needs no extra download;
-> no third-party scores or game audio are bundled.
->
-> **Status: audio → sheet works. Sheet-image OMR (photo/PDF → score) is a half-finished
-> prototype and is NOT recommended** — it needs a 300 MB external Java program, loses
-> 9–20% of the source notes just to fit the 3-notes-per-slot limit, and misreads time/key
-> signatures sometimes. Use MusicXML if you can export it.
->
+> **English (short):** sky15 turns a piano recording or MusicXML into sheet text for
+> 15-key instruments like Sky: Children of the Light (8 slots per bar, ≤3 simultaneous
+> notes per slot). Tempo, key and the two hands are detected automatically; output can be
+> played back, exported to MIDI/PNG/PDF, or played on an on-screen 15-key pad.
+> On our own 80-song set: F1 95.1 on clean audio, 92.0 over the whole set, tempo 76/80,
+> key 80/80. Backend is Transkun 2.0 (MIT, weights bundled in its pip package, CPU-only works).
+> Note: audio → sheet is solid; **OMR from sheet-music photos is still a prototype** —
+> use MusicXML when you can export it.
 > See `CONTRIBUTING.md` if you want to help.
 
 ## 安装
@@ -120,6 +108,12 @@ sky15/tools/      杂项：MIDI 渲染、占位音色生成
 
 ## 已知限制
 
+- **图片识谱（谱面照片 / PDF / 截图）是半成品，不好用**：靠开源的 Audiveris 做识别，
+  它自己就要装一个 300+ MB 的 Java 程序，多数图片还得先放大 2 倍才认得准（一页 15 秒）；
+  认出来的音同一时刻常挤着 4~9 个，而 15 键每格只能按 3 个，为塞进去必须砍音
+  （1× 砍 **20.4%**、2× 砍 **9.3%**），被砍的就是听出来的漏音；源音真正落到键上约
+  **78%**（2× 时 89%，准确率 100%）；拍号/调号也会读错（有份 2/4 被读成 3/4），
+  反复、D.C.、装饰音处理得不完整。**要转五线谱请优先用 MusicXML。**
 - 录屏、混响重、声音太小的录音，转出来会明显变差（`sky15.audioq` 会先给体检分）
 - 同一格里超过 3 个音只能留 3 个，这是乐器本身的限制，不是算法问题
 - 变速演奏（rubato）能跟上 ±1%，更大幅度的起伏仍会掉
