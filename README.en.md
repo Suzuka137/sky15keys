@@ -30,6 +30,11 @@ whole set; tempo correct 76/80, key correct 80/80.**
 > page) and then **replays the recognised score as piano audio before transcribing**, so notes
 > the OMR missed are heard back at that stage. Images must be **staff notation**: numbered
 > (jianpu) notation, 15-key game screenshots and ordinary photos are refused with a clear reason.
+>
+> One heads-up: **the image path is still a work in progress**. It is fussy about the picture —
+> clean scans read fine, but casual phone photos that are skewed or shadowed can drop notes and
+> sometimes misread the time signature. For dependable output use audio or MusicXML; those two
+> are the calibrated paths.
 
 It depends only on Python and public models, and contains no third-party score data. The
 48 instrument samples in the web UI are synthesised at build time from

@@ -24,6 +24,10 @@
 > 图片这条路是本地自动识谱（开源 [homr](https://github.com/liebharc/homr)，CPU 跑，一页 5~9 秒），
 > 识出来的谱再**先弹成钢琴音频过一遍转谱模型**，识谱漏掉的音会在这一步被听回来。
 > 图片**只认五线谱**：简谱、光遇 15 键格子谱、照片里的别的东西，一律不转——传上去会直接告诉你原因。
+>
+> 顺带提一句：**看图这条路还算半成品**，准不准很吃图片。扫描的、正对着拍的还行；
+> 手机随手拍、拍歪了、有阴影的，会漏音，偶尔连拍号都读错。要稳就走音频或 MusicXML，
+> 那两条路是反复标定过的。
 
 只依赖 Python 与公开模型，不含任何第三方曲谱数据。界面上那 48 个音色是
 从 [Salamander Grand Piano](https://archive.org/details/SalamanderGrandPianoV3)（CC-BY 3.0）
@@ -37,6 +41,9 @@
 > key 80/80. Backend is Transkun 2.0 (MIT, weights bundled in its pip package, CPU-only works).
 > Note: recordings, MusicXML and staff-notation images/PDFs all work; images are read with
 > local OMR (homr) and replayed as piano audio before transcription.
+> The image path is still a work in progress: it is fussy about the picture — clean scans are
+> fine, casual phone photos with skew or shadow can drop notes or misread the time signature.
+> For dependable results use audio or MusicXML.
 > See `CONTRIBUTING.md` if you want to help.
 
 ## 安装
