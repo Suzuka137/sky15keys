@@ -845,6 +845,12 @@
     $('#dl-smc').href = '/api/export/' + id + '?mode=smc' + v;
     $('#dl-midi').href = '/api/export/' + id + '?mode=midi' + v;
     if ($('#dl-piano')) $('#dl-piano').href = '/api/export/' + id + '?mode=piano&v=' + S.rev;
+    var dbg = $('#dl-omrdebug');
+    if (dbg) {
+      var hasDbg = !!(S.job && S.job.omr_debug);
+      dbg.classList.toggle('hidden', !hasDbg);
+      if (hasDbg) dbg.href = S.job.omr_debug;
+    }
     $('#dl-page').href = '/api/export/' + id + '?mode=page&page=' + S.page + '&' + expQuery() + v;
   }
 

@@ -238,11 +238,14 @@ def _public(job) -> dict:
         d = dict(job)
     t0 = d.pop("_t0", None)
     aq = d.get("_audioq")
+    dbg = d.get("_omr_debug")
     for k in [k for k in list(d) if k.startswith("_")]:
         d.pop(k, None)
     if aq:
         # 录音体检结果在转谱阶段就能拿到，先给前端，别等任务结束
         d["quality"] = aq
+    if dbg:
+        d["omr_debug"] = f"/api/omrdebug/{d.get('id')}"
     if t0 and d.get("status") in ("queued", "running"):
         d["elapsed"] = round(time.time() - t0, 1)
     d.setdefault("elapsed", 0.0)
@@ -389,7 +392,38 @@ def _advice_for(res: dict) -> list:
     return out
 
 
-def _tempo_note(parsed, tempo):
+def _bar_quarters(time_sig):
+    """一小节等于几个四分音符。2/4→2，3/4→3，4/4→4，6/8→3，12/8→6。"""
+    try:
+        num, den = str(time_sig or "4/4").split("/")
+        num, den = int(num), int(den)
+        if num <= 0 or den <= 0:
+            return 4.0
+        return 4.0 * num / den
+    except Exception:
+        return 4.0
+
+
+def _grid_tempo(tempo_q, time_sig):
+    """谱面「每分钟四分音符数」→ 15 键格子速度。
+
+    15 键谱的硬约定是**一小节永远 8 格**（格子 = 八分音符的时值），
+    而谱面一小节有 `_bar_quarters` 个四分音符。要让 8 格正好铺满一小节：
+
+        格子时长 = 小节秒数 / 8 =(bar_q × 60/tempo_q) / 8
+        格子速度 = 60/(2×格子时长) = 4 × tempo_q / bar_q
+
+    4/4 时等于原速度（所以以前从没露过这个问题）；2/4 时会翻倍 ——
+    用户 2026-10-23 上传一张 2/4 谱（谱面写 100 BPM），说 199 才是对的，
+    就是这个换算。以前直接把 100 当格子速度，一小节被拉成两小节那么长。
+    """
+    bq = _bar_quarters(time_sig)
+    if bq <= 0:
+        return float(tempo_q)
+    return 4.0 * float(tempo_q) / bq
+
+
+def _tempo_note(parsed, tempo, time_sig=None):
     """结果芯片上那句"速度是怎么定的"——给用户看，不要贴整张速度表。
 
     谱子里没写速度时 MusicXML 没速度可依，`parse_full` 会退回 100 BPM，
@@ -852,7 +886,7 @@ def do_rearrange(job, p: dict) -> dict:
 
 # ---------------------------------------------------------------- 三种 worker
 def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
-                         fixed_tempo=None, fixed_ts=None):
+                         fixed_tempo=None, fixed_ts=None, fixed_note=None):
     """转谱事件（秒）→ 测速 → 重排 → 出谱。
 
     音频任务、以及「五线谱先弹成钢琴音频再转谱」这条路，共用这一段：
@@ -871,7 +905,7 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
     if fixed_tempo:
         tempo, phase, why = float(fixed_tempo), 0.0, {}
         hit, conf, doubled = 1.0, "谱面", 0
-        grid = f"按谱面速度 {int(round(tempo))} BPM · {ts}"
+        grid = fixed_note or f"按谱面速度 {int(round(tempo))} BPM · {ts}"
         job["_cache"] = {"timebase": "sec", "events": events, "time_sig": ts}
         _stage(job, "tempo", 1.0)
         _ck(job)
@@ -908,7 +942,9 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
             hit = float(B.grid_quality([e["start"] for e in events], tempo, phase))
         except Exception:
             hit = 1.0
-        conf, doubled, grid = "手动", int(why.get("doubled") or 0), "手填速度"
+        conf, doubled = "手动", int(why.get("doubled") or 0)
+        # 速度可能是文件名字里读回来的（我们导出的钢琴声），那句话要如实显示
+        grid = job.pop("_tempo_note", None) or "手填速度"
         job["_cache"] = {"timebase": "sec", "events": events, "time_sig": "4/4"}
     else:
         tempo, phase, why = B.select_grid(events)
@@ -1017,6 +1053,30 @@ def _sheet_to_audio_events(job, secs):
     return ev, name
 
 
+_BPM_IN_NAME = re.compile(r"(\d{2,3})\s*BPM", re.I)
+
+
+def _tempo_from_name(name):
+    """从文件名里读回我们自己导出的那个速度。
+
+    导出的「钢琴声」就是按谱面速度弹出来的，文件名形如
+    `雨爱_钢琴声（原谱·100BPM）.mp3`——用户拖回来时直接采信它，
+    比重新从音频里猜稳得多（猜成一半/两倍会让整首错位）。
+    只有名字里带「钢琴声」才认，避免误判用户自己的文件名。
+    """
+    s = str(name or "")
+    if "钢琴声" not in s:
+        return None
+    m = _BPM_IN_NAME.search(s)
+    if not m:
+        return None
+    try:
+        v = int(m.group(1))
+    except Exception:
+        return None
+    return v if 20 <= v <= 400 else None
+
+
 def _run_audio(job):
     T = mod("transcribe")
     path = job["_payload"]["path"]
@@ -1064,6 +1124,15 @@ def _run_audio(job):
                          code="no_notes")
     _stage(job, "transcribe", 1.0)
     _ck(job)
+    # 文件名里带着我们自己导出的速度（`…_钢琴声（原谱·100BPM）.mp3`）时直接采信：
+    # 那段音频就是按这个速度弹的，重新猜只会猜错（用户 2026-10-23 就是因为这个
+    # 发现“五线谱直接转”和“转成 mp3 再拖回来”结果不一样）。
+    if not _int_or_none(opts.get("tempo")):
+        t_name = _tempo_from_name(job.get("name") or "")
+        if t_name:
+            opts = dict(opts, tempo=t_name)
+            job["params"] = opts
+            job["_tempo_note"] = f"速度取自文件名 {t_name} BPM"
     return _arrange_from_events(job, events, opts,
                                 backend_name=backend_name, bpm_guess=_bpm_guess)
 
@@ -1090,18 +1159,26 @@ def _run_score(job):
     _ck(job)
 
     _stage(job, "tempo", 0.5)
-    # 手填速度 = 用户要的速度；没填就用谱子自带的（可能中途变速，走 tempo_map，
+    # 手填速度 = 用户要的**格子速度**（跟站点那个"速度"字段一致）；
+    # 没填就用谱子自带的（可能中途变速，走 tempo_map，
     # 反复/一二结尾/D.C./D.S. 已经在 parse_full 里展开成演奏顺序）
+    time_sig = time_sig or "4/4"
     want = _int_or_none(opts.get("tempo"))
     warp = None
     if want:
-        tempo = int(_clamp(want, 20, 400))
+        tempo_grid = float(_clamp(want, 20, 400))
+        # 谱面按"每分钟四分音符"算秒，格子速度要换算回去
+        tempo = tempo_grid * _bar_quarters(time_sig) / 4.0
         secs = MX.to_seconds(events, tempo)
-        grid_note = f"手动 {tempo} BPM"
+        grid_note = f"手动 {int(tempo_grid)} BPM"
     else:
         tempo = int(_clamp(_int_or_none(tempo_file) or 120, 20, 400))
+        tempo_grid = _grid_tempo(tempo, time_sig)
         secs = parsed.to_seconds()
         grid_note = _tempo_note(parsed, tempo)
+        if abs(tempo_grid - tempo) > 0.5:
+            # 2/4、3/4、6/8… 一小节不是 8 个八分音符，得把速度折算成"一格 8 分"的速度
+            grid_note += (f" · {time_sig} 一小节 8 格 → {int(round(tempo_grid))} BPM")
         # 谱面自己写了变速（渐快/渐慢/换段）时，秒已经按分段速度积分过，
         # 而格子只有一个固定 tempo —— 直接喂进去，变速段的音会被抖到格子外。
         # 这里把「秒 → 拍」反推回来除以 0.5 当 warp，格子就跟着谱面的速度走。
@@ -1114,7 +1191,7 @@ def _run_score(job):
                 grid_note += " · 跟随谱面变速"
             except Exception as exc:
                 log(f"变速映射建不起来，按固定速度出谱：{exc}")
-    time_sig = time_sig or "4/4"
+    tempo = int(round(tempo_grid))
     # 十六分格（速度 ×2）默认关：2026-10-23 用户听过 A/B（9009 十六分格 / 9010 八分格）
     # 之后说「算了你改回来吧，我之后不用五线谱转了，不太行」——密谱并没有换来更好听，
     # 只是谱子长一倍、速度数字翻倍，反而更碎。判定代码留在 sky15/grid.py 里没删，
@@ -1148,7 +1225,7 @@ def _run_score(job):
         try:
             ev2, _bk = _sheet_to_audio_events(job, secs)
             return _arrange_from_events(job, ev2, opts, backend_name=_bk,
-                                        fixed_tempo=tempo, fixed_ts=time_sig)
+                                        fixed_tempo=tempo, fixed_ts=time_sig, fixed_note=grid_note)
         except Exception as exc:                   # 音色/转谱坏了不能连谱都不出
             log(f"谱面→钢琴音频这条路失败，回退直排：{exc}")
             job["_via_audio"] = {"fallback": f"{type(exc).__name__}: {exc}"[:160]}
@@ -1195,7 +1272,8 @@ def _run_omr(job):
         # 实测同一页 1× 出 317 音/覆盖 99.5%，2× 只剩 231 音/覆盖 71.6%。
         _stage(job, "omr", 0.15, note="选引擎")
         made, omr_best = OM.to_musicxml_best(
-            path, on_step=lambda msg, info: _stage(job, "omr", 0.3, note=msg))
+            path, keep_debug=True,
+            on_step=lambda msg, info: _stage(job, "omr", 0.3, note=msg))
     except Exception as e:
         tail = str(e).strip().splitlines()
         tail = next((x for x in reversed(tail) if x.strip()), "")
@@ -1219,6 +1297,8 @@ def _run_omr(job):
                                  "或者直接拖 MusicXML 进来，比识图又快又准。",
                                  f"引擎原话：{tail[:160]}"]) from e
     job["_omr_best"] = omr_best
+    if omr_best.get("debug_notes"):
+        job["_omr_debug"] = omr_best["debug_notes"]
     _stage(job, "omr", 1.0)
     _ck(job)
 
@@ -1259,16 +1339,21 @@ def _run_omr(job):
     _stage(job, "tempo", 1.0)
     _ck(job)
 
+    time_sig = time_sig or "4/4"
     want = _int_or_none(opts.get("tempo"))
     warp = None
     if want:
-        tempo = int(_clamp(want, 20, 400))
+        tempo_grid = float(_clamp(want, 20, 400))
+        tempo = tempo_grid * _bar_quarters(time_sig) / 4.0
         secs = MX.to_seconds(events, tempo)
-        grid_note = f"手动 {tempo} BPM"
+        grid_note = f"手动 {int(tempo_grid)} BPM"
     else:
         tempo = int(_clamp(_int_or_none(tempo_file) or 120, 20, 400))
+        tempo_grid = _grid_tempo(tempo, time_sig)
         secs = parsed.to_seconds()
         grid_note = _tempo_note(parsed, tempo)
+        if abs(tempo_grid - tempo) > 0.5:
+            grid_note += (f" · {time_sig} 一小节 8 格 → {int(round(tempo_grid))} BPM")
         tmap = list(getattr(parsed, "tempo_map", None) or [])
         if len({round(float(b), 3) for _p, b in tmap}) > 1:
             try:
@@ -1277,7 +1362,7 @@ def _run_omr(job):
                 grid_note += " · 跟随谱面变速"
             except Exception as exc:
                 log(f"变速映射建不起来，按固定速度出谱：{exc}")
-    time_sig = time_sig or "4/4"
+    tempo = int(round(tempo_grid))
     # 同 _run_score：十六分格默认关（用户 2026-10-23 听过 A/B 后裁定不用）。
     AUTO_DOUBLE_GRID = False
     if AUTO_DOUBLE_GRID and not want and warp is None:
@@ -1310,7 +1395,7 @@ def _run_omr(job):
             ev2, _bk = _sheet_to_audio_events(job, secs)
             job["_omr_note"] = grid_note
             return _arrange_from_events(job, ev2, opts, backend_name=_bk,
-                                        fixed_tempo=tempo, fixed_ts=time_sig)
+                                        fixed_tempo=tempo, fixed_ts=time_sig, fixed_note=grid_note)
         except Exception as exc:
             log(f"谱面→钢琴音频这条路失败，回退直排：{exc}")
             job["_via_audio"] = {"fallback": f"{type(exc).__name__}: {exc}"[:160]}
@@ -1568,6 +1653,16 @@ class App(SimpleHTTPRequestHandler):
                 return self._err(404, "找不到这个任务，可能已经被清掉了。",
                                  ["重新上传一次就行；历史里的记录还能点开看。"])
             return self._json(_public(job))
+        if kind == "omrdebug":
+            job = _get_job(jid)
+            src = (job or {}).get("_omr_debug")
+            if not src or not os.path.exists(src):
+                return self._err(404, "这次没有留下识别叠图。",
+                                 ["只有用图片识谱（homr）的任务才有这张图；"
+                                  "拖音频或 MusicXML 进来的没有。"])
+            with open(src, "rb") as f:
+                data = f.read()
+            return self._bytes(data, "image/png", "识别到的音符.png", inline=True)
         if kind in ("download", "image", "export", "info"):
             job = _get_job(jid)
             text = _smc_text(jid)
@@ -1645,6 +1740,14 @@ class App(SimpleHTTPRequestHandler):
             data, label = _piano_audio(text, jid, src, legato=legato)
             if legato:
                 label += "·连奏"
+            # 文件名里带上速度：这段音频是我们自己按这个速度弹出来的，
+            # 用户把它再拖回来时就不用重新猜速度了（猜错会整首错位，用户 2026-10-23 踩过）。
+            try:
+                bpm_tag = int(round(float(smc.parse_meta(text).get("tempo") or 0)))
+            except Exception:
+                bpm_tag = 0
+            if bpm_tag:
+                label += f"·{bpm_tag}BPM"
             # 响应头只能是 latin-1，中文 label 放文件名里，头里给 ascii 代号
             code = ("score" if "原谱" in label else "keys") + ("+legato" if legato else "")
             return self._bytes(data, "audio/mpeg",
