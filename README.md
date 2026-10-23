@@ -97,6 +97,22 @@ python -m sky15 omr   乐谱截图.jpg -o 出.smc            # 图片识谱 → 
 - 录音体检分（`audioq`）：混响太重、采样率太低、音头糊了会提前告警
 - 音频质量差或速度估错时给建议，不是闷着出错
 
+## 反过来：乐谱 → 钢琴音频
+
+有时候你要的不是 15 键谱，而是**先听听这谱子到底是什么样**。`pianorender` 用真正的钢琴采样
+（Salamander Grand Piano V3，CC-BY，每个音 16 个力度层）把谱子直接弹出来：
+
+```bash
+python -m sky15.pianorender 谱子.musicxml          # → 谱子.wav
+python -m sky15.pianorender 谱子.jpg --mp3         # 五线谱图片（会先识谱，慢）
+python -m sky15.pianorender 曲子.smc -o 输出目录    # 15 键谱也能弹
+```
+
+支持 MusicXML / MIDI / `.smc` / 图片·PDF；渲染时按音高挑采样层，松键有 0.3 秒释放，
+整首按峰值归一到 -1 dBFS。仓库里那 48 个 mp3 不够用时，下
+[Salamander Grand Piano V3](https://archive.org/details/SalamanderGrandPianoV3) 并用
+`SKY15_SALAMANDER` 指向解压目录，音质会好一个档次。
+
 ## 乐谱格式
 
 `曲名:[X] 速度:[120] 节拍:[4/4] 调性:[E(8vb)] 难度:[3] 曲谱:[...]`
