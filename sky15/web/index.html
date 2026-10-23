@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>sky15 · 15 键谱面工作台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%235b6cff'/%3E%3Cg fill='%23fff'%3E%3Crect x='7' y='7' width='5' height='5' rx='1.4'/%3E%3Crect x='13.5' y='7' width='5' height='5' rx='1.4'/%3E%3Crect x='20' y='7' width='5' height='5' rx='1.4'/%3E%3Crect x='7' y='13.5' width='5' height='5' rx='1.4'/%3E%3Crect x='13.5' y='13.5' width='5' height='5' rx='1.4'/%3E%3Crect x='20' y='13.5' width='5' height='5' rx='1.4'/%3E%3Crect x='7' y='20' width='5' height='5' rx='1.4'/%3E%3Crect x='13.5' y='20' width='5' height='5' rx='1.4'/%3E%3Crect x='20' y='20' width='5' height='5' rx='1.4'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 40 40" aria-hidden="true">
+      <rect class="lg-bg" width="40" height="40" rx="10"/>
+      <g class="lg-key">
+        <rect x="6"  y="6"  width="7.6" height="7.6" rx="2"/>
+        <rect x="16.2" y="6" width="7.6" height="7.6" rx="2"/>
+        <rect x="26.4" y="6" width="7.6" height="7.6" rx="2"/>
+        <rect x="6"  y="16.2" width="7.6" height="7.6" rx="2"/>
+        <rect x="16.2" y="16.2" width="7.6" height="7.6" rx="2"/>
+        <rect x="26.4" y="16.2" width="7.6" height="7.6" rx="2"/>
+        <rect x="6"  y="26.4" width="7.6" height="7.6" rx="2"/>
+        <rect x="16.2" y="26.4" width="7.6" height="7.6" rx="2"/>
+        <rect x="26.4" y="26.4" width="7.6" height="7.6" rx="2"/>
+      </g>
+    </svg>
+    <div class="brand-txt">
+      <b>sky15</b>
+      <span>把一首歌变成光遇的 15 键谱</span>
+    </div>
+  </div>
+  <div class="top-actions">
+    <button id="btn-theme" class="chip" title="深浅色切换" aria-label="深浅色切换">浅色</button>
+    <div class="fsgroup" role="group" aria-label="字号">
+      <button id="btn-fs-down" class="chip sq" title="字号变小" aria-label="字号变小">A−</button>
+      <button id="btn-fs-up" class="chip sq" title="字号变大" aria-label="字号变大">A+</button>
+    </div>
+    <button id="btn-history" class="chip" aria-label="历史记录">历史<span id="hist-count" class="badge hidden"></span></button>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ============ 空态 ============ -->
+  <section id="empty" class="empty" aria-label="上传引导">
+    <div class="empty-art" aria-hidden="true">
+      <svg viewBox="0 0 120 96">
+        <rect class="ea-frame" x="8" y="16" width="104" height="64" rx="12"/>
+        <path class="ea-arrow" d="M60 70 V34 m0 0 l-9 9 m9-9 l9 9"/>
+        <circle class="ea-dot" cx="30" cy="40" r="3"/>
+        <circle class="ea-dot" cx="90" cy="44" r="3"/>
+        <circle class="ea-dot" cx="46" cy="58" r="3"/>
+        <circle class="ea-dot" cx="76" cy="62" r="3"/>
+      </svg>
+    </div>
+    <h1>拖一个文件进来</h1>
+    <p class="empty-lead">
+      录音、录屏、MusicXML、还有本工具导出的 <code>.smc</code>，都能直接丢进来。
+      一次拖好几个也行，会排队一个接一个转。
+    </p>
+    <p class="empty-warn">
+      ⚠️ 谱面<strong>照片/截图</strong>（图片识谱）是半成品：会先砍掉 9~20% 的音才塞进
+      “每格最多 3 个音”，拍号调号也可能读错。想要准的请用 <strong>MusicXML</strong>（MuseScore 等都能导出）。
+    </p>
+    <div class="empty-actions">
+      <button id="btn-pick" class="btn primary">选文件</button>
+      <button id="btn-demo" class="btn">先看看示例《小星星》</button>
+    </div>
+    <ul class="empty-tips">
+      <li><kbd>Ctrl</kbd>+<kbd>V</kbd> 直接粘剪贴板里的截图或图片链接</li>
+      <li>手机录音尽量贴近乐器，别外放翻录——那会让测速和识谱都跑偏</li>
+      <li>谱面能存成图片带走：长图给手机滚着看，PDF 适合打印</li>
+    </ul>
+  </section>
+
+  <!-- ============ 转谱设置 ============ -->
+  <section id="panel" class="panel" aria-label="转谱设置">
+    <button id="panel-toggle" class="panel-head" aria-expanded="true">
+      <span class="ph-title">转谱设置</span>
+      <span id="panel-summary" class="ph-sum">自动测速 · 自动定调 · 加左手和弦</span>
+      <svg class="ph-chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+    </button>
+    <div id="panel-body" class="panel-body">
+      <label class="field">
+        <span class="lbl">速度 BPM</span>
+        <input id="opt-tempo" type="number" inputmode="numeric" min="20" max="400" placeholder="自动测">
+        <span class="hint">自动测不准就填原曲标的数</span>
+      </label>
+      <label class="field">
+        <span class="lbl">调性</span>
+        <select id="opt-key"></select>
+        <span class="hint">默认让程序挑最顺手的调</span>
+      </label>
+      <label class="field">
+        <span class="lbl">转谱后端</span>
+        <select id="opt-backend">
+          <option value="">自动（推荐：Transkun 2.0）</option>
+          <option value="transkun">Transkun 2.0（真实录音最准，快）</option>
+          <option value="piano">钢琴模型（合成音更准，慢）</option>
+          <option value="librosa">快速旋律（只抓单音）</option>
+        </select>
+        <span class="hint">用手机录/游戏里放的音，选自动或 Transkun；自己合成的钢琴 MIDI 转音频可选钢琴模型</span>
+      </label>
+      <label class="field">
+        <span class="lbl">左手和弦</span>
+        <select id="opt-chords">
+          <option value="auto">自动判断</option>
+          <option value="on">每格都加</option>
+          <option value="off">只留主旋律</option>
+        </select>
+        <span class="hint">在光遇里单手弹选「只留主旋律」</span>
+      </label>
+      <label class="field">
+        <span class="lbl">每格最多几个音</span>
+        <select id="opt-maxnotes">
+          <option value="3">3 个（满配）</option>
+          <option value="2">2 个</option>
+          <option value="1">1 个（单音旋律）</option>
+        </select>
+        <span class="hint">手指忙不过来就减到 1 个</span>
+      </label>
+      <label class="field">
+        <span class="lbl">速度起伏（自己弹的/自由节奏）</span>
+        <select id="opt-rubato">
+          <option value="auto">自动判断</option>
+          <option value="on">跟随起伏</option>
+          <option value="off">按固定速度</option>
+        </select>
+        <span class="hint">录真人演奏选「自动」；整首慢慢变快变慢它才动手</span>
+      </label>
+    </div>
+  </section>
+
+  <!-- ============ 任务队列 ============ -->
+  <section id="jobs" class="jobs" aria-label="任务队列"></section>
+
+  <!-- ============ 结果 ============ -->
+  <section id="result" class="result" aria-label="转谱结果" hidden>
+
+    <div class="res-head">
+      <div class="res-title-wrap">
+        <h2 id="res-title">未命名</h2>
+        <div id="res-chips" class="chips"></div>
+      </div>
+      <div class="res-head-actions">
+        <button id="btn-rerun-top" class="btn small">重算</button>
+        <button id="btn-res-close" class="btn small ghost" title="收起结果">收起</button>
+      </div>
+    </div>
+
+    <div id="res-advice" class="advice"></div>
+
+    <div class="res-grid">
+      <!-- 左：播放 + 键位 -->
+      <div class="res-side">
+        <div class="card transport" id="transport">
+          <div class="tr-row">
+            <button id="btn-play" class="play" aria-label="播放">
+              <svg class="ic-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>
+              <svg class="ic-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h3v14H8zM13 5h3v14h-3z"/></svg>
+            </button>
+            <div class="tr-main">
+              <input id="prog" class="range" type="range" min="0" max="0" value="0" step="1" aria-label="播放进度">
+              <div class="tr-meta">
+                <span id="prog-label">0:00 / 0:00</span>
+                <span id="bar-now" class="bar-now">第 1 小节</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="tr-row wrap">
+            <label class="mini">
+              <span>速度</span>
+              <input id="rate" class="range short" type="range" min="50" max="150" step="5" value="100" aria-label="播放速度">
+              <b id="rate-val">1.00×</b>
+            </label>
+            <label class="mini switch">
+              <input id="metro" type="checkbox">
+              <span>节拍器</span>
+            </label>
+            <label class="mini switch">
+              <input id="loop-on" type="checkbox">
+              <span>循环</span>
+            </label>
+            <span class="mini loop-range">
+              <input id="loop-a" type="number" min="1" value="1" aria-label="循环起始小节">
+              <span>到</span>
+              <input id="loop-b" type="number" min="1" value="1" aria-label="循环结束小节">
+              <span>小节</span>
+            </span>
+          </div>
+
+          <div id="bar-ruler" class="bar-ruler" aria-label="小节导航"></div>
+        </div>
+
+        <div class="card padcard">
+          <div class="card-head">
+            <span class="ch-title">15 键面板</span>
+            <div class="ch-actions">
+              <label class="mini switch">
+                <input id="pad-focus" type="checkbox">
+                <span>只显示用到的键</span>
+              </label>
+            </div>
+          </div>
+          <div id="pad-wrap" class="pad-wrap"></div>
+          <p class="pad-hint">点方块发声，键盘 <kbd>Y</kbd><kbd>U</kbd><kbd>I</kbd><kbd>O</kbd><kbd>P</kbd>
+            / <kbd>H</kbd><kbd>J</kbd><kbd>K</kbd><kbd>L</kbd><kbd>;</kbd>
+            / <kbd>N</kbd><kbd>M</kbd><kbd>,</kbd><kbd>.</kbd><kbd>/</kbd> 也能弹</p>
+        </div>
+
+        <div class="card tunecard">
+          <div class="card-head">
+            <span class="ch-title">调参重算</span>
+            <span class="ch-note">用同一份转谱缓存，不重新转谱</span>
+          </div>
+          <div class="tune-grid">
+            <label class="field tight">
+              <span class="lbl">速度 BPM</span>
+              <input id="tune-tempo" type="number" inputmode="numeric" min="20" max="400">
+            </label>
+            <label class="field tight">
+              <span class="lbl">调性</span>
+              <select id="tune-key"></select>
+            </label>
+            <label class="field tight">
+              <span class="lbl">左手和弦</span>
+              <select id="tune-chords">
+                <option value="auto">自动判断</option>
+                <option value="on">每格都加</option>
+                <option value="off">只留主旋律</option>
+              </select>
+            </label>
+            <label class="field tight">
+              <span class="lbl">每格最多几个音</span>
+              <select id="tune-maxnotes">
+                <option value="3">3 个</option>
+                <option value="2">2 个</option>
+                <option value="1">1 个</option>
+              </select>
+            </label>
+          </div>
+          <div class="tune-alts hidden" id="tune-alts">
+            <span class="alts-lbl">测速拿不准时，点一下换个速度看：</span>
+            <span class="alts-list" id="tune-alts-list"></span>
+          </div>
+          <div class="tune-actions">
+            <button id="btn-rerun" class="btn primary">重算</button>
+            <button id="btn-reset-tune" class="btn ghost">恢复自动测速</button>
+            <span id="tune-state" class="tune-state"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右：谱面 -->
+      <div class="res-main">
+        <div class="card scorecard">
+          <div class="card-head">
+            <span class="ch-title">谱面</span>
+            <div class="ch-actions">
+              <button id="btn-score-text" class="btn small ghost">源码文本</button>
+            </div>
+          </div>
+          <div class="score-box" id="score-box">
+            <img id="score-img" class="score-img" alt="谱面预览" title="点一下看大图">
+            <div id="score-loading" class="score-loading">正在画谱面…</div>
+          </div>
+          <div class="page-nav" id="page-nav" hidden>
+            <button id="pg-prev" class="btn small" aria-label="上一页">上一页</button>
+            <span class="pg-info"><b id="pg-num">1</b> / <span id="pg-count">1</span> 页</span>
+            <button id="pg-next" class="btn small" aria-label="下一页">下一页</button>
+            <a id="dl-page" class="btn small ghost" download>存这一页</a>
+          </div>
+          <pre id="smc-text" class="smc-text" hidden></pre>
+        </div>
+
+        <div class="card exportcard">
+          <div class="card-head">
+            <span class="ch-title">带走</span>
+            <div class="ch-actions">
+              <label class="mini">
+                <span>配色</span>
+                <select id="exp-theme" class="tiny">
+                  <option value="dark">深色（照着屏幕弹）</option>
+                  <option value="light">浅色（打印/白底）</option>
+                </select>
+              </label>
+              <label class="mini">
+                <span>清晰度</span>
+                <select id="exp-dpi" class="tiny">
+                  <option value="150">标准 150</option>
+                  <option value="200">清晰 200</option>
+                  <option value="300">打印 300</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <div class="export-grid">
+            <a id="dl-long" class="btn dl" download>长图 PNG</a>
+            <a id="dl-pages" class="btn dl" download>分页 PNG（压缩包）</a>
+            <a id="dl-pdf" class="btn dl" download>PDF</a>
+            <a id="dl-smc" class="btn dl" download>谱面文本 .smc</a>
+            <a id="dl-midi" class="btn dl" download>MIDI</a>
+            <button id="btn-copy-smc" class="btn">复制文本</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>全部在本地跑，音频不上传任何服务器。</span>
+  <span id="foot-ver"></span>
+</footer>
+
+<!-- 拖拽遮罩 -->
+<div id="dropmask" class="dropmask" aria-hidden="true">
+  <div class="dm-box">
+    <svg viewBox="0 0 48 48" aria-hidden="true"><path d="M24 34V12m0 0l-8 8m8-8l8 8M8 36h32"/></svg>
+    <b>松手就上传</b>
+    <span>可以一次拖好几个</span>
+  </div>
+</div>
+
+<!-- 历史 -->
+<dialog id="history" class="hist">
+  <div class="hist-head">
+    <b>历史记录</b>
+    <button id="hist-close" class="chip sq" aria-label="关闭">✕</button>
+  </div>
+  <div id="hist-list" class="hist-list"></div>
+  <p class="hist-foot">存在 <code>out/web_history.json</code>，关掉浏览器也在。</p>
+</dialog>
+
+<input id="file" type="file" multiple hidden
+       accept=".smc,.wav,.mp3,.flac,.m4a,.aac,.ogg,.opus,.wma,.mp4,.mov,.mkv,.webm,.musicxml,.xml,.mxl,.pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp">
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="player.js"></script>
+<script src="pad.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
