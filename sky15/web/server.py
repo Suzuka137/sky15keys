@@ -1,0 +1,1651 @@
+# -*- coding: utf-8 -*-
+"""sky15 网页界面服务端（纯标准库，不装任何 web 框架）。
+
+启动：
+    python -m sky15.web.server --port 8799
+    python sky15\\web\\server.py 8777          # 老写法，仍然认
+    python -m sky15.web.server --port 8777 --open     # 起完自动开浏览器
+
+接口一览（旧的三个字段一律不动，只加不删）：
+    POST /api/convert?name=&tempo=&key=&backend=&chords=&harmony=&max_notes=
+    GET  /api/job/<id>                 任务快照（阶段、进度、结果、建议）
+    GET  /api/download/<id>            下载 .smc
+    GET  /api/image/<id>?fmt=png|pdf|preview&theme=&dpi=     ← 参数语义冻结，勿改
+    GET  /api/export/<id>?mode=long|pages|pdf|smc|midi|page&theme=&dpi=&page=
+    GET  /api/info/<id>                页数等统计（导出面板用）
+    POST /api/rearrange/<id>           用缓存的转谱结果就地重排（不重新转谱）
+    POST /api/cancel/<id>              请求取消（安全点退出，不硬杀线程）
+    GET  /api/history                  历史（服务端持久化）
+    POST /api/history/<id>/rename      {"title": "..."}
+    POST /api/history/<id>/delete
+    POST /api/example                  加载内置示例
+    GET  /api/ping                     健康检查
+
+设计取舍：
+* 单 worker 线程串行跑任务。转谱吃 GPU/CPU，并发只会互相拖慢，
+  前端排队体验反而更好；队列里能看到自己排第几。
+* 取消是「打标记 + 安全点检查」，不 kill 线程：模型推理中途硬杀会留下
+  半截文件，还可能卡住 CUDA 上下文。
+* 成品 .smc 落 `out/web_jobs/`，历史落 `out/web_history.json`，重启不丢。
+"""
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import queue
+import re
+import secrets
+import shutil
+import socket
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import urllib.parse
+import zipfile
+from http.server import SimpleHTTPRequestHandler
+from socketserver import ThreadingTCPServer
+from pathlib import Path
+
+WEB = Path(__file__).resolve().parent
+ROOT = WEB.parent                                   # ...\sky15
+if str(ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(ROOT.parent))
+
+from sky15 import layout, smc                        # 轻量模块，直接导入
+from sky15.web import midiout, scoreio
+
+VERSION = "2.0"
+
+OUT = ROOT / "out"
+JOBS_DIR = OUT / "web_jobs"
+CACHE_DIR = OUT / "web_cache"
+HIST_FILE = OUT / "web_history.json"
+WORK = Path(tempfile.gettempdir()) / "sky15_web"
+for _d in (OUT, JOBS_DIR, CACHE_DIR, WORK):
+    _d.mkdir(parents=True, exist_ok=True)
+
+SHEET_EXT = {".musicxml", ".xml", ".mxl"}
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".pdf", ".webp"}
+SMC_EXT = {".smc"}
+SAFE_EXT = re.compile(r"^\.[a-z0-9]{1,9}$")   # `.musicxml` 是 9 个字符
+
+# 阶段表：kind -> [(key, 中文标签)]
+STAGES = {
+    "audio": [("probe", "抽音轨"), ("transcribe", "转谱"), ("tempo", "测速"),
+              ("arrange", "重排"), ("render", "出谱")],
+    "score": [("read", "读五线谱"), ("tempo", "定速"), ("arrange", "重排"),
+              ("render", "出谱")],
+    "omr": [("omr", "识别谱面"), ("read", "解析音符"), ("tempo", "定速"),
+            ("arrange", "重排"), ("render", "出谱")],
+    "smc": [("read", "读谱面"), ("render", "出谱")],
+}
+
+# ---------------------------------------------------------------- 模块懒加载
+_MODS: dict = {}
+
+
+def mod(name):
+    """按需导入 sky15 内部模块。
+
+    转谱要拉 torch/librosa，几十秒起步；服务一起来就 import 会让「打开页面」
+    等半天。render 额外支持热重载（改字体/布局不用重启服务）。
+    """
+    m = _MODS.get(name)
+    if m is not None:
+        return m
+    import importlib
+    m = importlib.import_module("sky15." + name)
+    if name == "render":
+        m = _reload_if_changed(m)
+    _MODS[name] = m
+    return m
+
+
+def _reload_if_changed(m):
+    try:
+        src = getattr(m, "__file__", None)
+        if not src:
+            return m
+        stamp = os.path.getmtime(src)
+        if getattr(m, "_web_stamp", None) == stamp:
+            return m
+        import importlib
+        m = importlib.reload(m)
+        m._web_stamp = stamp
+    except Exception:
+        pass
+    return m
+
+
+# ---------------------------------------------------------------- 全局状态
+JOBS: dict = {}
+PENDING: list = []
+JOBS_LOCK = threading.RLock()
+JOBQ: "queue.Queue[str]" = queue.Queue()
+HISTORY: list = []
+HIST_LOCK = threading.RLock()
+_RENDER_INDEX: dict = {}
+_RENDER_LOCK = threading.Lock()
+_WORKER_STARTED = False
+
+
+class HumanError(Exception):
+    """带人话建议的错误。"""
+
+    def __init__(self, message, advice=None, code=""):
+        super().__init__(message)
+        self.advice = list(advice or [])
+        self.code = code or ""
+
+
+class _Cancelled(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- 小工具
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _int_or_none(v):
+    try:
+        if v in (None, "", "auto", "自动"):
+            return None
+        n = int(float(v))
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _bool(v, default=True):
+    if v in (None, ""):
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "on", "yes", "是", "开"):
+        return True
+    if s in ("0", "false", "off", "no", "否", "关"):
+        return False
+    return default
+
+
+def _pretty_title(name: str) -> str:
+    """文件名 → 曲名：去扩展名、去下划线/连字符堆、去掉常见的机器后缀。"""
+    stem = os.path.splitext(os.path.basename(name or ""))[0]
+    stem = re.sub(r"[_\-]+", " ", stem)
+    stem = re.sub(r"\b(final|new|demo|test|out|mix|master|final\d*)\b", "", stem,
+                  flags=re.I)
+    # 去掉"01 - 曲名"这类轨道号，但**纯数字文件名要留住**（"40.wav" 曾经被削成"未命名"）
+    m = re.match(r"^\d{1,3}[\s._-]+(.+)$", stem)
+    if m and m.group(1).strip(" ._-"):
+        stem = m.group(1)
+    stem = re.sub(r"\s{2,}", " ", stem).strip(" ._-")
+    return stem or "未命名"
+
+
+def _safe_filename(s: str, fallback="sky15") -> str:
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", (s or "").strip())
+    s = s.strip(" ._")
+    return (s or fallback)[:80]
+
+
+def _quote(s: str) -> str:
+    return urllib.parse.quote(s, safe="")
+
+
+def _mime_of(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    return {
+        ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8", ".json": "application/json; charset=utf-8",
+        ".svg": "image/svg+xml", ".png": "image/png", ".pdf": "application/pdf",
+        ".smc": "text/plain; charset=utf-8", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+    }.get(ext, "application/octet-stream")
+
+
+# ---------------------------------------------------------------- 任务快照
+def _set(job, **kw):
+    with JOBS_LOCK:
+        job.update(kw)
+
+
+def _public(job) -> dict:
+    with JOBS_LOCK:
+        d = dict(job)
+    t0 = d.pop("_t0", None)
+    aq = d.get("_audioq")
+    for k in [k for k in list(d) if k.startswith("_")]:
+        d.pop(k, None)
+    if aq:
+        # 录音体检结果在转谱阶段就能拿到，先给前端，别等任务结束
+        d["quality"] = aq
+    if t0 and d.get("status") in ("queued", "running"):
+        d["elapsed"] = round(time.time() - t0, 1)
+    d.setdefault("elapsed", 0.0)
+    return d
+
+
+def _stage(job, key: str, frac: float = 0.0):
+    stages = job.get("stages") or []
+    idx, label = 0, job.get("stage") or ""
+    for i, s in enumerate(stages):
+        if s["key"] == key:
+            idx, label = i, s["label"]
+            break
+    n = max(1, len(stages))
+    prog = (idx + _clamp(frac, 0.0, 1.0)) / n
+    kw = {"stage": label, "stage_key": key, "stage_index": idx,
+          "progress": round(min(0.99, prog), 3)}
+    if job.get("status") == "queued":
+        kw["status"] = "running"
+    _set(job, **kw)
+
+
+def _ck(job):
+    """安全点：取消标记在这里生效。"""
+    if job.get("_cancel"):
+        raise _Cancelled()
+
+
+def new_job(kind: str, *, name: str, source: str, params: dict) -> dict:
+    jid = secrets.token_hex(6)
+    stages = [{"key": k, "label": lb} for k, lb in STAGES[kind]]
+    job = {
+        "id": jid, "kind": kind, "name": name, "source": source,
+        "status": "queued", "stage": "排队中", "stage_key": "queue",
+        "stage_index": 0, "stage_total": len(stages), "stages": stages,
+        "progress": 0.0, "queue_pos": 0, "params": dict(params or {}),
+        "created_at": time.time(), "elapsed": 0.0, "advice": [], "error": "",
+        # 旧前端兼容字段（完成时填真值）
+        "tempo": None, "confidence": "", "hit": None, "grid": "", "notes": 0,
+        "doubled": 0,
+        "_t0": time.time(), "_cancel": False, "_cache": None, "_payload": {},
+    }
+    with JOBS_LOCK:
+        JOBS[jid] = job
+        PENDING.append(jid)
+        for i, qid in enumerate(PENDING):
+            if qid in JOBS:
+                JOBS[qid]["queue_pos"] = i + 1
+    return job
+
+
+def _enqueue(job):
+    JOBQ.put(job["id"])
+
+
+# ---------------------------------------------------------------- 结果组装
+def _advice_for(res: dict) -> list:
+    """根据结果里的信号，给能直接照做的话。"""
+    out = []
+    hit = res.get("hit")
+    conf = res.get("confidence")
+    doubled = int(res.get("doubled") or 0)
+    notes = int(res.get("notes") or 0)
+    kind = res.get("kind")
+    params = res.get("params") or {}
+
+    if kind == "audio" and conf in ("中", "低") and params.get("tempo") in (None, ""):
+        if isinstance(hit, (int, float)) and hit < 70:
+            out.append({
+                "level": "warn",
+                "text": f"自动测速只有 {int(hit)}% 的把握。这首歌速度八成有起伏"
+                        f"（自由节奏、渐快渐慢），机测最容易在这里翻车。"
+                        f"照着谱面或原曲标出的 BPM 填进「速度」，点重算就对了。",
+                "action": "tempo",
+            })
+    if doubled:
+        if (res.get("audioq") or {}).get("level") in ("ok", "bad"):
+            out.append({
+                "level": "warn",
+                "text": f"音头被糊掉了，自动测速跟着跑偏（这次把网格放大了 {doubled} 倍）。"
+                        f"谱面或原曲标着速度的话，直接填进「速度」再点重算，比让机器猜稳。",
+                "action": "tempo",
+            })
+        else:
+            out.append({
+                "level": "warn",
+                "text": f"自动测速把网格放大了 {doubled} 倍才对上音头，说明实际速度可能只有一半："
+                        f"把速度填成 {max(40, int((res.get('tempo') or 120) / 2))} 试试。",
+                "action": "tempo",
+            })
+    if kind == "audio" and notes and notes < 24:
+        out.append({
+            "level": "warn",
+            "text": f"只识别到 {notes} 个音，像是没听清。确认录音里主要就是钢琴或单音乐器，"
+                    f"音量别太小；手机外放录的、环境吵的，识别率会掉很多。",
+            "action": "file",
+        })
+    if res.get("backend") == "librosa_pyin":
+        out.append({
+            "level": "info",
+            "text": "这次用的是「快速旋律」后端，只抓单音——和弦会丢。想要完整伴奏，换回自动/钢琴模型再转一次。",
+            "action": "backend",
+        })
+    if kind == "smc":
+        out.append({"level": "info",
+                    "text": "这是直接打开的现成谱面，没经过转谱。改速度、调性、和弦都能直接重算。",
+                    "action": ""})
+    aq = res.get("audioq") or {}
+    if kind == "audio" and aq.get("ok"):
+        if aq.get("level") == "bad":
+            out.append({
+                "level": "warn",
+                "text": f"这段录音本身有问题（质量 {aq['score']}/100）："
+                        + "；".join(aq.get("warnings") or [])
+                        + "。上面这些错，很大一部分是录音带来的，换一份干净的源文件会好很多。",
+                "action": "file",
+            })
+        elif aq.get("level") == "ok" and aq.get("warnings"):
+            out.append({
+                "level": "info",
+                "text": f"录音体检 {aq['score']}/100：" + "；".join(aq["warnings"]) + "。",
+                "action": "",
+            })
+        if aq.get("note"):
+            out.append({"level": "info", "text": aq["note"] + "，不用管。", "action": ""})
+    return out
+
+
+def _tempo_note(parsed, tempo):
+    """结果芯片上那句"速度是怎么定的"——给用户看，不要贴整张速度表。
+
+    谱子里没写速度时 MusicXML 没速度可依，`parse_full` 会退回 100 BPM，
+    这时明说"谱面没写速度，按 100 走"，用户才知道该不该手填。
+    """
+    tm = list(getattr(parsed, "tempo_map", []) or [])
+    found = bool(getattr(parsed, "tempo_found", True))
+    if len(tm) > 1:
+        return f"变速 {len(tm)} 段（{tempo} BPM 起）"
+    if found:
+        return f"谱面自带 {tempo} BPM"
+    return f"谱面没写速度，按 {tempo} BPM"
+
+
+def _build_result(jid: str, text: str, *, kind: str, backend: str = "",
+                  params: dict | None = None, extra: dict | None = None) -> dict:
+    s = scoreio.summary(text)
+    res = {
+        "title": s["title"], "key": s["key"], "key_raw": s["key_raw"],
+        "tempo": s["tempo"], "time_sig": s["time_sig"],
+        "notes": s["notes"], "seconds": s["seconds"], "backend": backend or "",
+        "smc": text, "bars": s["bars"], "groups": s["groups"],
+        "difficulty": s["difficulty"], "has8vb": s["has8vb"],
+        "confidence": "手动", "hit": 100, "grid": "", "doubled": 0,
+        "kind": kind, "job_id": jid, "params": dict(params or {}),
+        "warnings": [], "advice": [],
+    }
+    res.update(extra or {})
+    res["download"] = f"/api/download/{jid}"
+    res["preview"] = f"/api/image/{jid}?fmt=preview&theme=dark"
+    res["files"] = {
+        "smc": f"/api/export/{jid}?mode=smc",
+        "midi": f"/api/export/{jid}?mode=midi",
+        "png_long": f"/api/export/{jid}?mode=long",
+        "png_pages": f"/api/export/{jid}?mode=pages",
+        "pdf": f"/api/export/{jid}?mode=pdf",
+        "preview": f"/api/image/{jid}?fmt=preview&theme=dark",
+    }
+    res["advice"] = _advice_for(res)
+    return res
+
+
+def _tempo_alts(why, tempo) -> list:
+    """测速先验也判不出的那两首（40 号 127 vs 254、315 号 124 vs 166=3/4 倍），
+    与其硬猜，不如把候选速度摊给用户点一下。界面上一键重排（/api/rearrange）。
+    """
+    out = []
+    for a in (why or {}).get("alts") or []:
+        t = int(a.get("tempo") or 0)
+        if not (40 <= t <= 320) or abs(t - int(tempo or 0)) < 1:
+            continue
+        out.append({"tempo": t, "factor": a.get("factor"),
+                    "npb": a.get("npb"), "fill": a.get("fill")})
+    return out[:3]
+
+
+def _finish(job, text: str, *, backend: str = "", extra: dict | None = None):
+    """落盘 + 组装结果 + 预热预览 + 写历史。"""
+    jid = job["id"]
+    _stage(job, "render", 0.2)
+    _ck(job)
+    path = JOBS_DIR / f"{jid}.smc"
+    path.write_text(text, encoding="utf-8")
+    res = _build_result(jid, text, kind=job["kind"], backend=backend,
+                        params=job["params"], extra=extra)
+    res["smc_path"] = str(path)
+    try:                                   # 预览图先渲一张，用户切过去不用等
+        _render_to(text, "preview", "dark", 110)
+    except Exception:
+        res["warnings"].append("预览图没渲出来，导出时再试一次。")
+    _stage(job, "render", 1.0)
+    _set(job, status="done", stage="完成", progress=1.0, result=res, advice=res["advice"])
+    # 老前端直接读 job.tempo / job.hit / job.grid，这里给它们留一份副本
+    _set(job, tempo=res.get("tempo"), confidence=res.get("confidence"),
+         hit=res.get("hit"), grid=res.get("grid"), notes=res.get("notes"),
+         doubled=res.get("doubled"), error="")
+    _history_upsert(_hist_entry(job, res))
+    return res
+
+
+def _hist_entry(job, res) -> dict:
+    now = time.time()
+    return {
+        "id": job["id"], "title": res.get("title") or "未命名",
+        "notes": res.get("notes") or 0,
+        "at": time.strftime("%H:%M:%S", time.localtime(now)),
+        "date": time.strftime("%Y-%m-%d", time.localtime(now)),
+        "ts": now, "kind": job["kind"],
+        "tempo": res.get("tempo"), "key": res.get("key"),
+        "time_sig": res.get("time_sig"), "seconds": res.get("seconds"),
+        "bars": res.get("bars"), "backend": res.get("backend") or "",
+        "source": job.get("source") or "", "name": job.get("name") or "",
+        "params": res.get("params") or {},
+        "confidence": res.get("confidence"), "hit": res.get("hit"),
+        "available": True,
+    }
+
+
+# ---------------------------------------------------------------- 历史持久化
+def _load_state():
+    global HISTORY
+    items = []
+    try:
+        if HIST_FILE.exists():
+            data = json.loads(HIST_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data = data.get("items") or data.get("history") or []
+            if isinstance(data, list):
+                items = [x for x in data if isinstance(x, dict) and x.get("id")]
+    except Exception:
+        traceback.print_exc()
+        items = []
+    for it in items:
+        it.setdefault("notes", 0)
+        it.setdefault("at", "")
+        it.setdefault("title", "未命名")
+        it["available"] = (JOBS_DIR / f"{it['id']}.smc").exists() or \
+                          (WORK / f"{it['id']}.smc").exists()
+    with HIST_LOCK:
+        HISTORY = items[:200]
+
+
+def _save_history():
+    with HIST_LOCK:
+        data = json.dumps({"items": HISTORY}, ensure_ascii=False, indent=1)
+    try:
+        tmp = HIST_FILE.with_suffix(".json.tmp")
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, HIST_FILE)
+    except Exception:
+        traceback.print_exc()
+
+
+def _history_upsert(entry: dict):
+    with HIST_LOCK:
+        for i, it in enumerate(HISTORY):
+            if it.get("id") == entry["id"]:
+                merged = dict(it)
+                merged.update(entry)
+                HISTORY[i] = merged
+                del HISTORY[200:]
+                break
+        else:
+            HISTORY.insert(0, entry)
+            del HISTORY[200:]
+    _save_history()
+
+
+# ---------------------------------------------------------------- 渲染 / 导出
+def _cache_path(jid, text, mode, theme, dpi, page, ext):
+    h = hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:10]
+    return CACHE_DIR / f"{jid}_{h}_{mode}_{theme}_{int(dpi)}_{int(page)}.{ext}"
+
+
+def _render_to(text: str, mode: str, theme: str = "dark", dpi: int = 150,
+               page: int = 1, jid: str = "", title: str = "",
+               bars: int = 0) -> bytes:
+    """统一出口。mode: preview / long / page / pagefit / pages / pdf。带磁盘缓存。
+    bars>0 时按指定「一行几小节」排版（手机竖屏用 2，字能大一倍）。"""
+    theme = theme if theme in ("dark", "light") else "dark"
+    dpi = int(_clamp(int(dpi or 150), 72, 400))
+    bars = int(_clamp(int(bars or 0), 0, 8))
+    jid = jid or hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+    ck_mode = mode if not bars or bars == 4 else f"{mode}b{bars}"
+    ropt = {}
+    if bars:
+        ropt["bars_per_row"] = bars
+
+    ext = {"preview": "png", "long": "png", "page": "png", "pagefit": "png",
+           "pages": "zip", "pdf": "pdf"}.get(mode, "png")
+    cpath = _cache_path(jid, text, ck_mode, theme, dpi, page, ext)
+    key = str(cpath)
+    with _RENDER_LOCK:
+        hit = _RENDER_INDEX.get(key)
+    if hit and cpath.exists() and cpath.stat().st_size > 0:
+        return cpath.read_bytes()
+    if cpath.exists() and cpath.stat().st_size > 0:
+        return cpath.read_bytes()
+
+    R = mod("render")
+    Buf = io.BytesIO
+    if mode == "preview":
+        img = R.render_first_page(text, dpi=110, theme=theme, **ropt)
+        img.thumbnail((760, 1400))
+        buf = Buf()
+        img.save(buf, "PNG", optimize=True)
+        data = buf.getvalue()
+    elif mode == "long":
+        pages = R.render_pages(text, dpi=dpi, theme=theme, paginate=False, **ropt)
+        buf = Buf()
+        pages[0].save(buf, "PNG", optimize=True)
+        data = buf.getvalue()
+    elif mode == "page":
+        pages = R.render_pages(text, dpi=dpi, theme=theme, **ropt)
+        idx = _clamp(int(page or 1) - 1, 0, len(pages) - 1)
+        buf = Buf()
+        pages[idx].save(buf, "PNG", optimize=True)
+        data = buf.getvalue()
+    elif mode == "pagefit":
+        # 第一页按内容裁边：手机上单页谱面不留整页空白，字更大
+        img = R.render_first_page(text, dpi=dpi, theme=theme, **ropt)
+        buf = Buf()
+        img.save(buf, "PNG", optimize=True)
+        data = buf.getvalue()
+    elif mode == "pages":
+        pages = R.render_pages(text, dpi=dpi, theme=theme, **ropt)
+        buf = Buf()
+        base = _safe_filename(title or "sky15")
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for i, img in enumerate(pages, 1):
+                one = Buf()
+                img.save(one, "PNG", optimize=True)
+                z.writestr(f"{base}_第{i:02d}页.png", one.getvalue())
+        data = buf.getvalue()
+    elif mode == "pdf":
+        pages = R.render_pages(text, dpi=dpi, theme=theme, **ropt)
+        buf = Buf()
+        pages[0].save(buf, "PDF", save_all=True, append_images=pages[1:],
+                      resolution=dpi, title=title or "sky15")
+        data = buf.getvalue()
+    else:
+        raise HumanError(f"不认识的导出格式：{mode}")
+    try:
+        cpath.write_bytes(data)
+        with _RENDER_LOCK:
+            _RENDER_INDEX[key] = cpath
+    except Exception:
+        pass
+    return data
+
+
+def _page_count(text: str, dpi: int = 150, bars: int = 0) -> int:
+    R = mod("render")
+    opt = {"dpi": dpi}
+    if bars:
+        opt["bars_per_row"] = int(bars)
+    try:
+        plan = R._plan(text, opt)
+        return max(1, len(plan["page_rows"]))
+    except Exception:
+        try:
+            return max(1, len(R.render_pages(text, **opt)))
+        except Exception:
+            return 1
+
+
+def _cache_gc(max_files=240):
+    try:
+        files = sorted(CACHE_DIR.glob("*"), key=lambda p: p.stat().st_mtime)
+        for f in files[:-max_files] if len(files) > max_files else []:
+            f.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 重排
+def do_rearrange(job, p: dict) -> dict:
+    """用缓存的事件表就地重排，不重新转谱。"""
+    A, B = mod("arrange"), mod("beats")
+    cache = job.get("_cache") or {}
+    prev = job.get("result") or {}
+    kind = job.get("kind") or "audio"
+
+    time_sig = cache.get("time_sig") or prev.get("time_sig") or "4/4"
+    tempo_arg = _int_or_none(p.get("tempo"))
+    key = (p.get("key") or "").strip()
+    if key.lower() in ("auto", "自动", "原调", ""):
+        key = None
+    max_notes = _clamp(_int_or_none(p.get("max_notes")) or 3, 1, 3)
+    harmony = _bool(p.get("harmony"), True)
+    chords = (p.get("chords") or "auto").strip().lower()
+    octv = (p.get("octave") or "off").strip().lower()
+    # 音区三档（界面）/ 四档（命令行）：
+    #   off   —— 不动：完全按源音频音高写，可能一片不带点
+    #   auto  —— 常见写法：整首偏低时唱名抬一层并打 (8vb)，发声高度不变
+    #   mel   —— 只抬旋律：每格最高的音抬一层，低音不动，发声真的高 12 半音
+    #   force —— 命令行 --octave high：抬得下就整首抬（同样打 8vb，声音不变）
+    octave_fit = ("force" if octv in ("high", "up", "+12", "高八度", "1")
+                  else "mel" if octv in ("mel", "melody", "只抬旋律", "2")
+                  else "off" if octv in ("off", "none", "0")
+                  else "auto")
+    hs = {"on": True, "off": False}.get(chords, "auto")
+    title = (p.get("title") or prev.get("title") or "未命名").strip() or "未命名"
+
+    conf, grid, doubled, hit = "手动", "", 0, 1.0
+    warp = None
+    if cache.get("timebase") == "beats":
+        tempo = tempo_arg or _int_or_none(cache.get("tempo")) or prev.get("tempo") or 120
+        events = scoreio.to_seconds(cache["events"], tempo)
+        phase = 0.0
+        conf, grid = "手动", "按谱面速度"
+        # 谱面自己带变速时，重排也得跟着谱面走（跟 `_run_score` 同一套）。
+        tmap = list(cache.get("tempo_map") or [])
+        if len({round(float(b), 3) for _q, b in tmap}) > 1:
+            sem = mod("score_semantics")
+            warp = (lambda tm: (lambda t: sem.seconds_to_slots(t, tm)))(tmap)
+            grid += " · 跟随谱面变速"
+    else:
+        events = cache.get("events") or []
+        if not events:
+            raise HumanError("这份结果没有可用的音符事件，得重新转一次。",
+                             advice=["把原文件重新拖进来转一次，再改参数。"])
+        if tempo_arg:
+            tempo, phase, why = B.select_grid(events, tempo_hint=tempo_arg)
+            try:
+                hit = float(B.grid_quality([e["start"] for e in events], tempo, phase))
+            except Exception:
+                hit = 1.0
+            conf = "手动"
+            grid = why.get("head") or why.get("reason") or ""
+            doubled = int(why.get("doubled") or 0)
+        else:
+            auto = cache.get("auto")
+            if not auto:
+                tempo, phase, why = B.select_grid(events)
+                try:
+                    h = float(why.get("base_hit")
+                              or B.grid_quality([e["start"] for e in events], tempo, phase))
+                except Exception:
+                    h = 1.0
+                auto = {"tempo": int(tempo), "phase": float(phase), "hit": h,
+                        "grid": why.get("head") or why.get("reason") or "",
+                        "doubled": int(why.get("doubled") or 0),
+                        "conf": "高" if h >= 0.85 else "中" if h >= 0.70 else "低"}
+                cache["auto"] = auto
+            tempo, phase = auto["tempo"], auto["phase"]
+            hit, conf = auto["hit"], auto["conf"]
+            grid, doubled = auto["grid"], auto["doubled"]
+
+    tempo = int(_clamp(int(tempo or 120), 20, 400))
+    text = A.arrange(events, tempo=tempo, time_sig=time_sig, key=key, title=title,
+                     offset=phase, warp=warp, harmony=harmony, max_notes=max_notes,
+                     hand_split=hs, octave_fit=octave_fit)
+    params = {"tempo": tempo, "key": key or "", "harmony": harmony,
+              "max_notes": max_notes, "chords": chords, "octave": octv,
+              "backend": prev.get("backend") or ""}
+    res = _build_result(job["id"], text, kind=kind,
+                        backend=prev.get("backend") or "", params=params,
+                        extra={"confidence": conf, "hit": int(round(hit * 100)),
+                               "grid": grid, "doubled": doubled, "rearranged": True,
+                               "auto_tempo": (cache.get("auto") or {}).get("tempo")})
+    path = JOBS_DIR / f"{job['id']}.smc"
+    path.write_text(text, encoding="utf-8")
+    res["smc_path"] = str(path)
+    with JOBS_LOCK:
+        job["result"] = res
+        job["params"] = params
+        job["_cache"] = cache
+        job["advice"] = res["advice"]
+        job.update(tempo=res.get("tempo"), confidence=res.get("confidence"),
+                   hit=res.get("hit"), grid=res.get("grid"),
+                   notes=res.get("notes"), doubled=res.get("doubled"))
+    _history_upsert(_hist_entry(job, res))
+    return res
+
+
+# ---------------------------------------------------------------- 三种 worker
+def _run_audio(job):
+    T, B, A = mod("transcribe"), mod("beats"), mod("arrange")
+    path = job["_payload"]["path"]
+    opts = job["params"]
+    wav, tmpdir = path, None
+    _stage(job, "probe", 0.05)
+    _ck(job)
+    ext = os.path.splitext(path)[1].lower()
+    # 录音体检：在花 20 秒跑模型之前先看一眼，结果随任务返回给前端显示。
+    # 不限扩展名 —— 上传落盘时可能没有真正后缀（临时文件名是 .bin），这里只管内容。
+    try:
+        job["_audioq"] = mod("audioq").analyze(path)
+    except Exception:
+        job["_audioq"] = None
+    if ext not in (".wav", ".flac"):
+        try:
+            wav = T.to_wav(path)
+        except Exception as e:
+            raise HumanError("抽取音频轨道失败，多半是没装 ffmpeg 或者这个文件格式不常见。",
+                             advice=["装一个 ffmpeg（winget install Gyan.FFmpeg）后重开界面，",
+                                     "或者自己先转成 .wav 再拖进来。"]) from e
+        tmpdir = os.path.dirname(wav)
+    _stage(job, "probe", 1.0)
+    _ck(job)
+
+    _stage(job, "transcribe", 0.02)
+    backend = (opts.get("backend") or "").strip() or None
+    try:
+        events, _bpm_guess, backend_name = T.transcribe(wav, backend=backend)
+    except RuntimeError as e:
+        msg = str(e)
+        if "ffmpeg" in msg.lower():
+            raise HumanError("转谱需要 ffmpeg 来读音频，本机 PATH 里找不到。",
+                             advice=["winget install Gyan.FFmpeg 之后重开界面。",
+                                     "已装的话，确认 ffmpeg.exe 在 PATH 里。"]) from e
+        raise
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    if not events:
+        raise HumanError("一个音符都没听出来。",
+                         advice=["确认文件里确实有声音（不是静音、不是纯人声说话）。",
+                                 "手机外放翻录的、环境吵的，识别率会掉得很厉害；",
+                                 "尽量用录音笔/内录/清一点的手机贴近录。"],
+                         code="no_notes")
+    _stage(job, "transcribe", 1.0)
+    _ck(job)
+
+    _stage(job, "tempo", 0.35)
+    hint = _int_or_none(opts.get("tempo"))
+    if hint:
+        tempo, phase, why = B.select_grid(events, tempo_hint=hint)
+        try:
+            hit = float(B.grid_quality([e["start"] for e in events], tempo, phase))
+        except Exception:
+            hit = 1.0
+        conf, doubled, grid = "手动", int(why.get("doubled") or 0), "手填速度"
+        job["_cache"] = {"timebase": "sec", "events": events, "time_sig": "4/4"}
+    else:
+        tempo, phase, why = B.select_grid(events)
+        try:
+            hit = float(why.get("base_hit")
+                        or B.grid_quality([e["start"] for e in events], tempo, phase))
+        except Exception:
+            hit = 1.0
+        conf = "高" if hit >= 0.85 else "中" if hit >= 0.70 else "低"
+        doubled = int(why.get("doubled") or 0)
+        # `why["head"]` 是数字（小节头命中率 0~1），`reason` 才是给人看的那句话。
+        # 以前写成 `why.get("head") or why.get("reason")`，好一点的输入就会把
+        # 芯片显示成「网格 0.787」——数字当文字了。
+        _head = why.get("head")
+        _reason = str(why.get("reason") or "").strip()
+        grid = (f"{_reason} · 命中 {_head * 100:.0f}%" if isinstance(_head, (int, float))
+                else _reason)
+        job["_cache"] = {"timebase": "sec", "events": events, "time_sig": "4/4",
+                         "auto": {"tempo": int(tempo), "phase": float(phase),
+                                  "hit": hit, "conf": conf, "grid": grid,
+                                  "doubled": doubled}}
+    _stage(job, "tempo", 1.0)
+    _ck(job)
+
+    key = (opts.get("key") or "").strip() or None
+    if key and key not in layout.KEY_MIDI:
+        key = None
+    job["params"] = dict(opts, tempo=int(tempo), key=key or "",
+                         backend=backend_name, confidence=conf,
+                         hit=int(round(hit * 100)), grid=grid)
+    _stage(job, "arrange", 0.35)
+    _ck(job)
+    # 速度起伏（rubato）：恒速网格对得上就完全不动，对不上才换分段网格。
+    # 干净音频实测 gq>=0.895（闸门 0.65 永不触发，结果与不加这条逐位相同），
+    # 真演奏漂 ±1~2% 时 gq 掉到 0.43~0.61 → 启用后 ±1% 从 21 分救到 75~96。
+    rubato_mode = (opts.get("rubato") or "auto").lower()
+    warp, winfo = None, {}
+    try:
+        warp, winfo = mod("warptrack").autowarp(events, tempo=float(tempo),
+                                               mode=rubato_mode)
+    except Exception as exc:                       # 拍点跟踪坏了不能影响出谱
+        log(f"autowarp 失败，按恒速出谱：{exc}")
+    kw = {}
+    if warp is not None:
+        kw["tempo_exact"] = float(winfo.get("tempo") or tempo)
+    job["rubato"] = {"applied": warp is not None, "mode": rubato_mode,
+                     "gq": round(float(winfo.get("gq") or 0.0), 3),
+                     "why": str(winfo.get("why") or "")}
+    text = A.arrange(events, tempo=int(tempo), time_sig="4/4", key=key,
+                     title=_pretty_title(job.get("name") or ""), offset=phase,
+                     harmony=_bool(opts.get("harmony"), True),
+                     max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
+                     hand_split={"on": True, "off": False}.get(
+                         (opts.get("chords") or "auto").lower(), "auto"),
+                     octave_fit=(lambda o: "force" if o in ("high", "up", "+12", "高八度", "1")
+                                 else "mel" if o in ("mel", "melody", "只抬旋律", "2")
+                                 else "off" if o in ("off", "none", "0")
+                                 else "auto")((opts.get("octave") or "").lower()),
+                     warp=warp, **kw)
+    _stage(job, "arrange", 1.0)
+    _finish(job, text, backend=backend_name,
+            extra={"confidence": conf, "hit": int(round(hit * 100)),
+                   "grid": grid, "doubled": doubled,
+                   "audioq": job.get("_audioq"),
+                   "rubato": job.get("rubato"),
+                   "tempo_alts": _tempo_alts(why, tempo),
+                   "bpm_guess": _int_or_none(_bpm_guess)})
+
+
+def _run_score(job):
+    MX, A = mod("musicxml"), mod("arrange")
+    path = job["_payload"]["path"]
+    opts = job["params"]
+    _stage(job, "read", 0.1)
+    _ck(job)
+    try:
+        parsed = MX.parse_full(path)
+        events, tempo_file, time_sig, key_file = (
+            parsed.events, parsed.tempo, parsed.time_sig, parsed.key)
+    except Exception as e:
+        raise HumanError("这份 MusicXML 没读通，可能是压缩包坏了或者版本不标准。",
+                         advice=["用打谱软件另存为 MusicXML（未压缩的 .musicxml）再试。",
+                                 ".mxl 是 zip，先解压出里面的 .xml 也可以。"]) from e
+    if not events:
+        raise HumanError("谱面里没解析到音符。",
+                         advice=["确认谱子里确实写着音符，而不是只有标题和文字。"],
+                         code="no_notes")
+    _stage(job, "read", 1.0)
+    _ck(job)
+
+    _stage(job, "tempo", 0.5)
+    # 手填速度 = 用户要的速度；没填就用谱子自带的（可能中途变速，走 tempo_map，
+    # 反复/一二结尾/D.C./D.S. 已经在 parse_full 里展开成演奏顺序）
+    want = _int_or_none(opts.get("tempo"))
+    warp = None
+    if want:
+        tempo = int(_clamp(want, 20, 400))
+        secs = MX.to_seconds(events, tempo)
+        grid_note = f"手动 {tempo} BPM"
+    else:
+        tempo = int(_clamp(_int_or_none(tempo_file) or 120, 20, 400))
+        secs = parsed.to_seconds()
+        grid_note = _tempo_note(parsed, tempo)
+        # 谱面自己写了变速（渐快/渐慢/换段）时，秒已经按分段速度积分过，
+        # 而格子只有一个固定 tempo —— 直接喂进去，变速段的音会被抖到格子外。
+        # 这里把「秒 → 拍」反推回来除以 0.5 当 warp，格子就跟着谱面的速度走。
+        # 单一速度的谱子 warp 与固定格子逐位等价，所以只在真的分了段时才挂。
+        tmap = list(getattr(parsed, "tempo_map", None) or [])
+        if len({round(float(b), 3) for _p, b in tmap}) > 1:
+            try:
+                sem = mod("score_semantics")
+                warp = (lambda tm: (lambda t: sem.seconds_to_slots(t, tm)))(tmap)
+                grid_note += " · 跟随谱面变速"
+            except Exception as exc:
+                log(f"变速映射建不起来，按固定速度出谱：{exc}")
+    time_sig = time_sig or "4/4"
+    # 十六分格（速度 ×2）默认关：2026-10-23 用户听过 A/B（9009 十六分格 / 9010 八分格）
+    # 之后说「算了你改回来吧，我之后不用五线谱转了，不太行」——密谱并没有换来更好听，
+    # 只是谱子长一倍、速度数字翻倍，反而更碎。判定代码留在 sky15/grid.py 里没删，
+    # 想再试就把 max_factor 改回 2（还能用 --grid16 之类的手动开关）。
+    AUTO_DOUBLE_GRID = False
+    if AUTO_DOUBLE_GRID and not want and warp is None:
+        try:
+            gmod = mod("grid")
+            factor, ginfo = gmod.choose_factor(secs, tempo)
+            if factor > 1:
+                tempo, time_sig = gmod.apply_factor(tempo, factor, time_sig)
+                grid_note += f" · 十六分格（速度 ×{factor}）"
+                print(f"格子翻倍：{ginfo.get('why')}", flush=True)
+        except Exception as exc:
+            print(f"格子判定跳过：{exc}", flush=True)
+    _stage(job, "tempo", 1.0)
+    _ck(job)
+
+    key = (opts.get("key") or "").strip() or None
+    if key and key not in layout.KEY_MIDI:
+        key = None
+    _stage(job, "arrange", 0.3)
+    _ck(job)
+    text = A.arrange(secs, tempo=tempo, time_sig=time_sig, key=key,
+                     title=_pretty_title(job.get("name") or ""), offset=0.0,
+                     warp=warp,
+                     harmony=_bool(opts.get("harmony"), True),
+                     max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
+                     hand_split={"on": True, "off": False}.get(
+                         (opts.get("chords") or "auto").lower(), "auto"))
+    job["_cache"] = {"timebase": "beats", "events": events, "tempo": tempo,
+                     "time_sig": time_sig,
+                     "tempo_map": list(getattr(parsed, "tempo_map", None) or [])}
+    job["params"] = dict(opts, tempo=tempo, key=key or "", backend="musicxml",
+                         confidence="手动", hit=100, grid=grid_note)
+    _stage(job, "arrange", 1.0)
+    _finish(job, text, backend="musicxml",
+            extra={"confidence": "手动", "hit": 100,
+                   "grid": grid_note, "doubled": 0,
+                   "source_tempo": _int_or_none(tempo_file),
+                   "score_warnings": len(getattr(parsed, "warnings", []) or [])})
+
+
+def _run_omr(job):
+    OM, MX, A = mod("omr"), mod("musicxml"), mod("arrange")
+    path = job["_payload"]["path"]
+    opts = job["params"]
+    _stage(job, "omr", 0.05)
+    _ck(job)
+    try:
+        ok = OM.available()
+    except Exception:
+        ok = False
+    if not ok:
+        raise HumanError("这台机器上没找到 Audiveris，五线谱图片认不了。",
+                         advice=["装 Audiveris（开源的五线谱识别工具）后重开界面；",
+                                 "或者用打谱软件导出 MusicXML，直接拖 .musicxml 进来——更快也更准；",
+                                 "实在只有图片，就手动对着图片把音高敲进 15 键面板。"],
+                         code="no_omr")
+    try:
+        made = OM.to_musicxml(path)
+    except Exception as e:
+        tail = str(e).strip().splitlines()
+        tail = next((x for x in reversed(tail) if x.strip()), "引擎没说原因")
+        raise HumanError("识谱引擎跑完了，但没能导出谱面。",
+                         advice=["换一张更清晰、正对镜头拍的谱面图（别斜拍、别压阴影）；",
+                                 "或者直接拖 MusicXML 进来，比识图又快又准。",
+                                 f"引擎原话：{tail[:160]}"]) from e
+    _stage(job, "omr", 1.0)
+    _ck(job)
+
+    if isinstance(made, (list, tuple)):
+        made = made[0] if made else None
+    if not made:
+        raise HumanError("识别跑完了但没产出谱面文件。",
+                         advice=["换一张更清晰的图片再试。"])
+    _stage(job, "read", 0.3)
+    _ck(job)
+    parsed = MX.parse_full(str(made))
+    events, tempo_file, time_sig, _key = (
+        parsed.events, parsed.tempo, parsed.time_sig, parsed.key)
+    if not events:
+        raise HumanError("识别出来的谱面是空的。", advice=["换一张更清晰的图片再试。"],
+                         code="no_notes")
+    _stage(job, "read", 1.0)
+    _stage(job, "tempo", 1.0)
+    _ck(job)
+
+    want = _int_or_none(opts.get("tempo"))
+    warp = None
+    if want:
+        tempo = int(_clamp(want, 20, 400))
+        secs = MX.to_seconds(events, tempo)
+        grid_note = f"手动 {tempo} BPM"
+    else:
+        tempo = int(_clamp(_int_or_none(tempo_file) or 120, 20, 400))
+        secs = parsed.to_seconds()
+        grid_note = _tempo_note(parsed, tempo)
+        tmap = list(getattr(parsed, "tempo_map", None) or [])
+        if len({round(float(b), 3) for _p, b in tmap}) > 1:
+            try:
+                sem = mod("score_semantics")
+                warp = (lambda tm: (lambda t: sem.seconds_to_slots(t, tm)))(tmap)
+                grid_note += " · 跟随谱面变速"
+            except Exception as exc:
+                log(f"变速映射建不起来，按固定速度出谱：{exc}")
+    time_sig = time_sig or "4/4"
+    # 同 _run_score：十六分格默认关（用户 2026-10-23 听过 A/B 后裁定不用）。
+    AUTO_DOUBLE_GRID = False
+    if AUTO_DOUBLE_GRID and not want and warp is None:
+        try:
+            gmod = mod("grid")
+            factor, ginfo = gmod.choose_factor(secs, tempo)
+            if factor > 1:
+                tempo, time_sig = gmod.apply_factor(tempo, factor, time_sig)
+                grid_note += f" · 十六分格（速度 ×{factor}）"
+                print(f"格子翻倍：{ginfo.get('why')}", flush=True)
+        except Exception as exc:
+            print(f"格子判定跳过：{exc}", flush=True)
+    key = (opts.get("key") or "").strip() or None
+    if key and key not in layout.KEY_MIDI:
+        key = None
+    _stage(job, "arrange", 0.4)
+    _ck(job)
+    text = A.arrange(secs, tempo=tempo, time_sig=time_sig, key=key,
+                     title=_pretty_title(job.get("name") or ""), offset=0.0,
+                     warp=warp,
+                     harmony=_bool(opts.get("harmony"), True),
+                     max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
+                     hand_split={"on": True, "off": False}.get(
+                         (opts.get("chords") or "auto").lower(), "auto"))
+    job["_cache"] = {"timebase": "beats", "events": events, "tempo": tempo,
+                     "time_sig": time_sig,
+                     "tempo_map": list(getattr(parsed, "tempo_map", None) or [])}
+    job["params"] = dict(opts, tempo=tempo, key=key or "", backend="audiveris",
+                         confidence="手动", hit=100, grid=grid_note)
+    _stage(job, "arrange", 1.0)
+    _finish(job, text, backend="audiveris",
+            extra={"confidence": "手动", "hit": 100, "grid": grid_note,
+                   "doubled": 0, "source_tempo": _int_or_none(tempo_file)})
+
+
+def _run_smc(job):
+    text = job["_payload"]["text"]
+    _stage(job, "read", 0.4)
+    _ck(job)
+    meta = smc.parse_meta(text)
+    events, _m = scoreio.smc_to_events(text)
+    job["_cache"] = {"timebase": "beats", "events": events,
+                     "tempo": _int_or_none(meta.get("tempo")) or 120,
+                     "time_sig": meta.get("time_sig") or "4/4"}
+    job["params"] = {"tempo": _int_or_none(meta.get("tempo")) or 120,
+                     "key": meta.get("key") or "", "harmony": True,
+                     "max_notes": 3, "chords": "auto", "backend": ""}
+    _stage(job, "read", 1.0)
+    _finish(job, text, backend="",
+            extra={"confidence": "手动", "hit": 100, "grid": "导入的现成谱面",
+                   "doubled": 0})
+
+
+_DISPATCH = {"audio": _run_audio, "score": _run_score,
+             "omr": _run_omr, "smc": _run_smc}
+
+
+def _humanize(exc) -> tuple:
+    if isinstance(exc, HumanError):
+        return str(exc), exc.advice
+    msg = str(exc) or exc.__class__.__name__
+    low = msg.lower()
+    if "ffmpeg" in low:
+        return ("转谱需要 ffmpeg，本机没找到。",
+                ["winget install Gyan.FFmpeg，然后重开界面。"])
+    if "audiveris" in low:
+        return ("没找到 Audiveris，五线谱图片暂时认不了。",
+                ["装 Audiveris 后重开；或者改用 MusicXML。"])
+    if "no module named" in low or "importerror" in low:
+        return (f"缺少运行这个功能需要的组件：{msg}",
+                ["按 README 的安装那段把依赖装上，再重开界面。"])
+    if "out of memory" in low or "cuda" in low:
+        return ("显存/内存不够了。",
+                ["关掉别的占内存的程序；或者把「转谱后端」切成「快速旋律」再试。"])
+    if isinstance(exc, FileNotFoundError):
+        return ("文件不见了或者路径读不到。",
+                ["重新拖一次原文件；上传一半就被关掉的情况也会这样。"])
+    if isinstance(exc, PermissionError):
+        return ("文件被别的程序占着，写不进去。",
+                ["关掉正在编辑这个文件的软件再试。"])
+    return (f"出错了：{msg}",
+            ["换个文件再试一次；一直这样的话，把 out\\web.log 最后一段发出来。"])
+
+
+def _worker():
+    while True:
+        jid = JOBQ.get()
+        job = JOBS.get(jid)
+        if job is None:
+            continue
+        with JOBS_LOCK:
+            if jid in PENDING:
+                PENDING.remove(jid)
+            for i, qid in enumerate(PENDING):
+                if qid in JOBS:
+                    JOBS[qid]["queue_pos"] = i + 1
+            job["queue_pos"] = 0
+        if job.get("_cancel"):
+            _set(job, status="cancelled", stage="已取消", progress=0.0)
+            continue
+        _set(job, status="running", stage="开始")
+        try:
+            _DISPATCH[job["kind"]](job)
+        except _Cancelled:
+            _set(job, status="cancelled", stage="已取消", result=None,
+                 advice=[{"level": "info", "text": "已取消。原文件没删，随时可以重新上传。"}])
+        except Exception as exc:
+            traceback.print_exc()
+            msg, advice = _humanize(exc)
+            _set(job, status="error", stage="出错", error=msg,
+                 advice=[{"level": "error", "text": a} for a in advice] or
+                        [{"level": "error", "text": msg}],
+                 result=None)
+        finally:
+            with JOBS_LOCK:
+                job["elapsed"] = round(time.time() - job.get("_t0", time.time()), 1)
+
+
+def start_worker():
+    global _WORKER_STARTED
+    with JOBS_LOCK:
+        if _WORKER_STARTED:
+            return
+        _WORKER_STARTED = True
+    threading.Thread(target=_worker, name="sky15-worker", daemon=True).start()
+
+
+# ---------------------------------------------------------------- HTTP
+class App(SimpleHTTPRequestHandler):
+    server_version = "sky15web/" + VERSION
+
+    def __init__(self, *a, **kw):
+        kw.setdefault("directory", str(WEB))
+        super().__init__(*a, **kw)
+
+    # 静音访问日志（刷屏没意义），出错还是打
+    def log_message(self, fmt, *args):
+        pass
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
+    # ---------- 输出helper
+    def _json(self, obj, code=200):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _bytes(self, data, mime, filename=None, inline=True, extra=None):
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        if filename:
+            ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "sky15"
+            disp = "inline" if inline else "attachment"
+            self.send_header("Content-Disposition",
+                             f"{disp}; filename=\"{ascii_name}\"; "
+                             f"filename*=UTF-8''{_quote(filename)}")
+        for k, v in (extra or {}).items():
+            self.send_header(k, str(v))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _err(self, code, message, advice=None, **extra):
+        body = {"error": message, "ok": False}
+        if advice:
+            body["advice"] = advice
+        body.update(extra)
+        self._json(body, code)
+
+    def _body(self, limit=512 * 1024 * 1024) -> bytes:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return b""
+        if n > limit:
+            raise HumanError(f"文件太大了（{n // 1024 // 1024} MB），超过 {limit // 1024 // 1024} MB 不收。",
+                             advice=["先剪一小段再转，或者自己压一下音频。"])
+        chunks, left = [], n
+        while left > 0:
+            b = self.rfile.read(min(left, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _q1(q, key, default=""):
+        v = q.get(key)
+        return (v[0] if isinstance(v, list) and v else v) or default
+
+    # ---------- 路由
+    def do_GET(self):
+        try:
+            u = urllib.parse.urlparse(self.path)
+            p = u.path
+            q = urllib.parse.parse_qs(u.query)
+            if p.startswith("/api/"):
+                return self._get_api(p, q)
+            return super().do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                msg, advice = _humanize(e)
+                self._err(500, msg, advice)
+            except Exception:
+                pass
+
+    def do_POST(self):
+        try:
+            u = urllib.parse.urlparse(self.path)
+            return self._post_api(u.path, urllib.parse.parse_qs(u.query))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except HumanError as e:
+            # HumanError.code 是人话错误码（字符串），不是 HTTP 状态码——不能再往 code= 里塞，
+            # 否则会撞上 _err 的第一个位置参数，直接 TypeError（调参重排曾因此 500）
+            extra = {"hcode": e.code} if e.code else {}
+            self._err(400, str(e), e.advice, **extra)
+        except Exception as e:
+            traceback.print_exc()
+            msg, advice = _humanize(e)
+            try:
+                self._err(500, msg, advice)
+            except Exception:
+                pass
+
+    def do_DELETE(self):
+        try:
+            p = urllib.parse.urlparse(self.path).path
+            if p.startswith("/api/history/"):
+                return self._history_delete(p.strip("/").split("/")[-1])
+            self._err(404, "没有这个接口")
+        except Exception:
+            traceback.print_exc()
+
+    # ---------- GET
+    def _get_api(self, p, q):
+        parts = [x for x in p.strip("/").split("/") if x]
+        if p == "/api/ping":
+            return self._json({"ok": True, "version": VERSION,
+                               "jobs": len(JOBS), "pending": len(PENDING),
+                               "history": len(HISTORY)})
+        if p == "/api/history":
+            with HIST_LOCK:
+                items = [dict(x) for x in HISTORY]
+            for it in items:
+                it["available"] = (JOBS_DIR / f"{it['id']}.smc").exists() or \
+                                  (WORK / f"{it['id']}.smc").exists()
+            return self._json({"items": items, "history": items, "count": len(items)})
+        if len(parts) < 3:
+            return self._err(404, "没有这个接口")
+        kind, jid = parts[1], parts[2]
+        if kind == "job":
+            job = _get_job(jid)
+            if job is None:
+                return self._err(404, "找不到这个任务，可能已经被清掉了。",
+                                 ["重新上传一次就行；历史里的记录还能点开看。"])
+            return self._json(_public(job))
+        if kind in ("download", "image", "export", "info"):
+            job = _get_job(jid)
+            text = _smc_text(jid)
+            if text is None:
+                return self._err(404, "这个任务的谱面文件不在了。",
+                                 ["重新上传一次；或者从历史里删掉这条记录。"])
+            if kind == "download":
+                title = (job or {}).get("result", {}).get("title") or _title_of(text)
+                fname = _safe_filename(title) + ".smc"
+                return self._bytes(text.encode("utf-8"),
+                                   "text/plain; charset=utf-8", fname,
+                                   inline=False)
+            if kind == "info":
+                s = scoreio.summary(text)
+                dpi = int(_clamp(int(self._q1(q, "dpi", 150) or 150), 72, 400))
+                bars = int(_clamp(int(_int_or_none(self._q1(q, "bars")) or 0), 0, 8))
+                s.update({"pages": _page_count(text, dpi, bars), "dpi": dpi,
+                          "bars_per_row": bars,
+                          "title_file": _safe_filename(s["title"])})
+                return self._json(s)
+            if kind == "image":
+                return self._serve_image(jid, text, q)
+            return self._serve_export(jid, text, q)
+        return self._err(404, "没有这个接口")
+
+    def _serve_image(self, jid, text, q):
+        """老接口，参数语义冻结：fmt=png 长图 / pdf / preview。"""
+        fmt = (self._q1(q, "fmt", "png") or "png").lower()
+        theme = self._q1(q, "theme", "dark")
+        dpi = int(_clamp(int(self._q1(q, "dpi", 150) or 150), 72, 400))
+        title = _title_of(text)
+        if fmt == "pdf":
+            data = _render_to(text, "pdf", theme, dpi, 1, jid, title)
+            return self._bytes(data, "application/pdf",
+                               _safe_filename(title) + ".pdf", inline=True)
+        if fmt == "preview":
+            data = _render_to(text, "preview", theme, 110, 1, jid, title)
+            return self._bytes(data, "image/png", None, inline=True)
+        data = _render_to(text, "long", theme, dpi, 1, jid, title)
+        return self._bytes(data, "image/png", _safe_filename(title) + ".png",
+                           inline=True)
+
+    def _serve_export(self, jid, text, q):
+        mode = (self._q1(q, "mode", "long") or "long").lower()
+        theme = self._q1(q, "theme", "dark")
+        dpi = int(_clamp(int(self._q1(q, "dpi", 150) or 150), 72, 400))
+        page = int(_int_or_none(self._q1(q, "page")) or 1)
+        bars = int(_clamp(int(_int_or_none(self._q1(q, "bars")) or 0), 0, 8))
+        title = _title_of(text)
+        base = _safe_filename(title)
+        if mode == "smc":
+            return self._bytes(text.encode("utf-8"), "text/plain; charset=utf-8",
+                               base + ".smc", inline=False)
+        if mode == "midi":
+            meta = smc.parse_meta(text)
+            groups = smc.parse_groups(text)
+            notes = scoreio.groups_to_notes(groups, meta)
+            data = midiout.build(notes, title=meta.get("title") or title,
+                                 tempo=int(meta.get("tempo") or 120),
+                                 time_sig=meta.get("time_sig") or "4/4")
+            return self._bytes(data, "audio/midi", base + ".mid", inline=False)
+        if mode == "info":
+            return self._json({"pages": _page_count(text, dpi, bars), "bars": bars})
+        if mode == "preview":
+            data = _render_to(text, "preview", theme, 110, 1, jid, title)
+            return self._bytes(data, "image/png", None, inline=True)
+        if mode == "pdf":
+            data = _render_to(text, "pdf", theme, dpi, 1, jid, title, bars)
+            return self._bytes(data, "application/pdf", base + ".pdf", inline=False)
+        if mode == "pages":
+            data = _render_to(text, "pages", theme, dpi, 1, jid, title, bars)
+            return self._bytes(data, "application/zip", base + "_分页.zip", inline=False)
+        if mode == "page":
+            data = _render_to(text, "page", theme, dpi, page, jid, title, bars)
+            return self._bytes(data, "image/png",
+                               f"{base}_第{page}页.png", inline=True,
+                               extra={"X-Page": page})
+        if mode == "pagefit":
+            data = _render_to(text, "pagefit", theme, dpi, 1, jid, title, bars)
+            return self._bytes(data, "image/png", base + "_第一页.png",
+                               inline=True, extra={"X-Page": 1})
+        data = _render_to(text, "long", theme, dpi, 1, jid, title, bars)
+        return self._bytes(data, "image/png", base + "_长图.png", inline=False)
+
+    # ---------- POST
+    def _post_api(self, p, q):
+        parts = [x for x in p.strip("/").split("/") if x]
+        if p == "/api/convert":
+            return self._convert(q)
+        if p == "/api/example":
+            return self._example()
+        if len(parts) >= 3 and parts[1] == "rearrange":
+            return self._rearrange(parts[2])
+        if len(parts) >= 3 and parts[1] == "cancel":
+            return self._cancel(parts[2])
+        if len(parts) >= 4 and parts[1] == "history":
+            jid, act = parts[2], parts[3]
+            if act == "rename":
+                return self._history_rename(jid)
+            if act == "delete":
+                return self._history_delete(jid)
+        return self._err(404, "没有这个接口")
+
+    def _convert(self, q):
+        name = (self._q1(q, "name") or "上传文件").strip()
+        ext = os.path.splitext(name)[1].lower()
+        if not SAFE_EXT.match(ext):
+            ext = ".bin"
+        raw = self._body()
+        if not raw:
+            raise HumanError("没收到文件内容（0 字节）。",
+                             advice=["重新拖一次；有些浏览器在文件被别处打开时会传空。"])
+        if ext in SHEET_EXT:
+            kind = "score"
+        elif ext in IMAGE_EXT:
+            kind = "omr"
+        elif ext in SMC_EXT:
+            kind = "smc"
+        elif raw[:5].lstrip().lower().startswith(b"<?xml") or raw[:2] == b"PK":
+            # 后缀不认识（.bin / 没后缀 / 导出工具自己起的名），但内容明显是
+            # MusicXML（明文 XML）或 .mxl（zip）—— 别丢给 ffmpeg 去抽音轨
+            kind = "score"
+        else:
+            kind = "audio"
+
+        params = {
+            "tempo": _int_or_none(self._q1(q, "tempo")) or "",
+            "key": (self._q1(q, "key") or "").strip(),
+            "backend": (self._q1(q, "backend") or "").strip(),
+            "chords": (self._q1(q, "chords") or "auto").strip(),
+            "harmony": _bool(self._q1(q, "harmony"), True),
+            "max_notes": _clamp(_int_or_none(self._q1(q, "max_notes")) or 3, 1, 3),
+        }
+        smc_text = None
+        if kind == "smc":
+            try:
+                smc_text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                smc_text = raw.decode("gbk", errors="replace")
+            if "曲谱" not in smc_text:
+                raise HumanError("这个 .smc 文件里没有「曲谱:」这一段。",
+                                 advice=["确认拖的是本工具导出的谱面文件，"
+                                         "用记事本打开能看到 曲名:[...] 速度:[...] 那种。"])
+        job = new_job(kind, name=name, source=name, params=params)
+        jid = job["id"]
+        if kind == "smc":
+            job["_payload"] = {"text": smc_text}
+        else:
+            dest = WORK / f"{jid}{ext}"
+            dest.write_bytes(raw)
+            job["_payload"] = {"path": str(dest)}
+        _enqueue(job)
+        return self._json({"job": jid, "id": jid, "kind": kind, "name": name,
+                           "queue_pos": job.get("queue_pos", 1), "ok": True})
+
+    def _example(self):
+        demo = WEB / "demo.smc"
+        if not demo.exists():
+            raise HumanError("内置示例文件不见了。", advice=["从 out\\ 里拖一个 .smc 进来同样能体验。"])
+        text = demo.read_text(encoding="utf-8")
+        job = new_job("smc", name="示例：小星星", source="内置示例", params={})
+        job["_payload"] = {"text": text}
+        _enqueue(job)
+        return self._json({"job": job["id"], "id": job["id"], "kind": "smc", "ok": True})
+
+    def _rearrange(self, jid):
+        job = _get_job(jid)
+        if job is None:
+            return self._err(404, "找不到这个任务。", ["重新上传一次。"])
+        if job.get("status") in ("queued", "running"):
+            return self._err(409, "这个任务还在跑，等它出结果再调参数。")
+        cache = job.get("_cache")
+        if not cache:
+            return self._err(409, "这份结果是重启后从历史里恢复的，转谱的中间数据已经不在内存里了，改参数重排不了。",
+                             ["把原文件重新拖进来转一次（可用历史里的参数），之后就能随便调。"],
+                             hcode="no_cache")
+        raw = self._body()
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        try:
+            res = do_rearrange(job, payload)
+        except HumanError as e:
+            return self._err(400, str(e), e.advice)
+        return self._json({"ok": True, "job": jid, "result": res})
+
+    def _cancel(self, jid):
+        job = JOBS.get(jid)
+        if job is None:
+            return self._err(404, "找不到这个任务。")
+        st = job.get("status")
+        if st in ("done", "error", "cancelled"):
+            return self._json({"ok": True, "status": st, "job": _public(job)})
+        _set(job, _cancel=True, stage="正在停下…",
+             stage_hint="正在跑模型，这一小段算完就退出（不会把已经算出来的一半丢掉）")
+        if st == "queued":
+            _set(job, status="cancelled", stage="已取消", progress=0.0, result=None)
+            with JOBS_LOCK:
+                if jid in PENDING:
+                    PENDING.remove(jid)
+                for i, qid in enumerate(PENDING):
+                    if qid in JOBS:
+                        JOBS[qid]["queue_pos"] = i + 1
+        return self._json({"ok": True, "status": job.get("status"), "job": _public(job)})
+
+    def _history_rename(self, jid):
+        raw = self._body(64 * 1024)
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            payload = {}
+        title = (payload.get("title") or "").strip()
+        if not title:
+            return self._err(400, "新名字是空的。")
+        title = title[:80]
+        found = False
+        with HIST_LOCK:
+            for it in HISTORY:
+                if it.get("id") == jid:
+                    it["title"] = title
+                    found = True
+                    break
+        job = JOBS.get(jid)
+        if job and isinstance(job.get("result"), dict):
+            job["result"]["title"] = title
+        if not found:
+            return self._err(404, "历史里没有这条记录。")
+        _save_history()
+        # 标题改了，谱面正文里的曲名也一起换掉，导出的图才一致
+        text = _smc_text(jid)
+        if text:
+            new_text = re.sub(r"曲名:\s*\[[^\]]*\]", "曲名:[" + title + "]", text, count=1)
+            if new_text != text:
+                (JOBS_DIR / f"{jid}.smc").write_text(new_text, encoding="utf-8")
+                if job and isinstance(job.get("result"), dict):
+                    job["result"]["smc"] = new_text
+        return self._json({"ok": True, "id": jid, "title": title})
+
+    def _history_delete(self, jid):
+        with HIST_LOCK:
+            before = len(HISTORY)
+            HISTORY[:] = [x for x in HISTORY if x.get("id") != jid]
+            removed = before != len(HISTORY)
+        with JOBS_LOCK:
+            JOBS.pop(jid, None)
+        for d in (JOBS_DIR, WORK):
+            try:
+                (d / f"{jid}.smc").unlink(missing_ok=True)
+            except Exception:
+                pass
+        _save_history()
+        if not removed:
+            return self._err(404, "历史里没有这条记录。")
+        return self._json({"ok": True, "id": jid})
+
+
+# ---------------------------------------------------------------- 任务读取
+def _smc_text(jid: str):
+    for d in (JOBS_DIR, WORK):
+        p = d / f"{jid}.smc"
+        if p.exists():
+            try:
+                return p.read_text(encoding="utf-8")
+            except Exception:
+                pass
+    return None
+
+
+def _title_of(text: str) -> str:
+    try:
+        return smc.parse_meta(text).get("title") or "未命名"
+    except Exception:
+        return "未命名"
+
+
+def _result_from_text(jid: str, text: str, it: dict) -> dict:
+    res = _build_result(jid, text, kind=(it or {}).get("kind") or "smc",
+                        backend=(it or {}).get("backend") or "",
+                        params=(it or {}).get("params") or {},
+                        extra={"confidence": (it or {}).get("confidence") or "手动",
+                               "hit": (it or {}).get("hit") or 100,
+                               "grid": "历史记录", "doubled": 0,
+                               "restored": True})
+    return res
+
+
+def _get_job(jid: str):
+    job = JOBS.get(jid)
+    if job is not None:
+        return job
+    with HIST_LOCK:
+        it = next((dict(x) for x in HISTORY if x.get("id") == jid), None)
+    if not it:
+        return None
+    text = _smc_text(jid)
+    if text is None:
+        return None
+    res = _result_from_text(jid, text, it)
+    stages = [{"key": k, "label": lb} for k, lb in STAGES.get(it.get("kind") or "smc",
+                                                             STAGES["smc"])]
+    job = {"id": jid, "kind": it.get("kind") or "smc",
+           "name": it.get("name") or it.get("source") or it.get("title"),
+           "source": it.get("source") or "", "status": "done", "stage": "完成",
+           "stage_key": "done", "stage_index": len(stages), "stage_total": len(stages),
+           "stages": stages, "progress": 1.0, "queue_pos": 0,
+           "params": it.get("params") or {}, "elapsed": it.get("elapsed") or 0,
+           "result": res, "advice": res.get("advice") or [], "restored": True,
+           "created_at": it.get("ts") or time.time(),
+           "_t0": time.time(), "_cancel": False, "_cache": None, "_payload": {}}
+    with JOBS_LOCK:
+        JOBS.setdefault(jid, job)
+    return JOBS.get(jid)
+
+
+# ---------------------------------------------------------------- 启动
+def _ensure_stdio():
+    """pythonw 起的进程没有控制台，print 会炸；把输出接到 web.log。"""
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            f = open(WEB / "web.log", "a", encoding="utf-8", buffering=1)
+        except Exception:
+            return
+        if sys.stdout is None:
+            sys.stdout = f
+        if sys.stderr is None:
+            sys.stderr = f
+
+
+def _port_busy(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((("127.0.0.1" if host in ("0.0.0.0", "") else host),
+                                       port), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+class Server(ThreadingTCPServer):
+    daemon_threads = True
+    # Windows 上 SO_REUSEADDR 会把「端口已被占用」变成静默双绑定，别开
+    allow_reuse_address = os.name != "nt"
+
+
+def serve(port: int = 8777, host: str = "127.0.0.1", open_browser: bool = False):
+    _ensure_stdio()
+    _load_state()
+    _cache_gc()
+    start_worker()
+    shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    url = f"http://{shown}:{port}/"
+    if _port_busy(host, port):
+        print(f"端口 {port} 上已经有一个 sky15 界面在跑了：{url}", flush=True)
+        if open_browser:
+            import webbrowser
+            webbrowser.open(url)
+        return 1
+    httpd = Server((host, port), App)
+    print(f"sky15 界面已启动：{url}    （Ctrl+C 停止）", flush=True)
+    print(f"  任务队列：单线程串行，避免转谱互相抢显存", flush=True)
+    print(f"  成品目录：{JOBS_DIR}", flush=True)
+    if open_browser:
+        threading.Timer(0.9, lambda: __import__("webbrowser").open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n收到 Ctrl+C，收工。", flush=True)
+    finally:
+        httpd.server_close()
+    return 0
+
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(prog="sky15.web.server", description="sky15 网页界面")
+    ap.add_argument("port_pos", nargs="?", type=int, default=None, help="端口（老写法）")
+    ap.add_argument("--port", type=int, default=None, help="端口，默认 8777")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="监听地址；手机要连就填 0.0.0.0")
+    ap.add_argument("--open", action="store_true", help="启动后自动开浏览器")
+    ap.add_argument("--no-browser", action="store_true", help="不要开浏览器")
+    a = ap.parse_args(argv)
+    port = a.port or a.port_pos or 8777
+    return serve(port=port, host=a.host,
+                 open_browser=(a.open and not a.no_browser))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
