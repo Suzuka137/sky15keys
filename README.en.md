@@ -7,7 +7,7 @@
 Drop in a piano recording — a phone recording, a game capture, audio ripped from a video —
 and get back the sheet text used by the 15-key instrument in *Sky: Children of the Light*:
 **8 slots per bar, at most 3 notes pressed together per slot**, matching the in-game keys
-one to one.
+one to one. Sheet music works too: images, PDFs and MusicXML.
 
 Tempo, key and the two hands are detected automatically; you do not fill in any parameter.
 The result plays back, exports to MIDI, saves as a long sheet image / paged images / PDF,
@@ -17,17 +17,19 @@ The evaluation is self-contained (we also ship the audio renderer used to build 
 numbers are reproducible: **on our own 80-song set, F1 95.1 on clean audio, 92.0 over the
 whole set; tempo correct 76/80, key correct 80/80.**
 
-- Input: `.mp3` `.m4a` `.wav` `.flac` video files, `.mid`, `.musicxml`/`.mxl`, existing `.smc`
-- Output: `.smc` sheet text, MIDI, PNG long image / paged images, PDF
+- Input: `.mp3` `.m4a` `.wav` `.flac` video files, `.mid`, `.musicxml`/`.mxl`, sheet-music
+  images / PDFs, existing `.smc`
+- Output: `.smc` sheet text, MIDI, piano-audio MP3, PNG long image / paged images, PDF
 - Backend: Transkun 2.0 (MIT; weights are bundled in the pip package, so it works right
   after install; no GPU required — roughly one minute per song on CPU)
 - Interface: a Python standard-library server with no framework dependency; double-click
   `sky15/web/start-ui.bat`
 
-> Boundaries, in one sentence: **audio → sheet is usable; recognising sheet-music *photos*
-> (OMR) is still a prototype.** The details are under "Known limitations" below. For
-> engraved scores, prefer MusicXML — MuseScore, Sibelius, Finale and Dorico all export it,
-> and purchased digital scores are usually `.mxl`.
+> **All three input kinds work**: piano recordings / videos, MusicXML, and sheet-music images
+> or PDFs. Image input runs local OMR ([homr](https://github.com/liebharc/homr), CPU, 5–9 s per
+> page) and then **replays the recognised score as piano audio before transcribing**, so notes
+> the OMR missed are heard back at that stage. Images must be **staff notation**: numbered
+> (jianpu) notation, 15-key game screenshots and ordinary photos are refused with a clear reason.
 
 It depends only on Python and public models, and contains no third-party score data. The
 48 instrument samples in the web UI are synthesised at build time from
@@ -66,7 +68,7 @@ Two **optional** external dependencies; missing ones only disable the matching i
 | Missing | Effect | Install |
 |---|---|---|
 | ffmpeg | audio/video input unavailable (MusicXML, MIDI and SMC still work) | `winget install Gyan.FFmpeg` |
-| Audiveris | sheet-music **images/PDF** cannot be recognised (MusicXML unaffected) | download, unzip, set `SKY15_AUDIVERIS` to `Audiveris.exe` |
+| homr | sheet-music **images/PDF** cannot be recognised (other inputs unaffected) | `pip install "homr[cpu]"`, then `homr --init`; or point `SKY15_HOMR` at `homr.exe` |
 
 ## Usage
 
@@ -74,7 +76,7 @@ Two **optional** external dependencies; missing ones only disable the matching i
 python -m sky15 audio my-recording.mp3 -o my-song.smc   # audio → sheet (recommended)
 python -m sky15 midi  song.mid         -o song.smc       # MIDI → sheet
 python -m sky15 smc   reference.smc    --tempo 120       # re-arrange an existing sheet
-python -m sky15 omr   screenshot.jpg   -o out.smc        # image → sheet (prototype, see above)
+python -m sky15 omr   score.jpg        -o out.smc        # staff-notation image/PDF → sheet
 ```
 
 Web UI: `python -m sky15.web.server` (or double-click `sky15/web/start-ui.bat`), then open
@@ -89,6 +91,10 @@ Web UI: `python -m sky15.web.server` (or double-click `sky15/web/start-ui.bat`),
 - A 15-key pad bound to `Y U I O P / H J K L ; / N M , . /`; clicking the squares works too
 - Sheets lay out at 4 bars per row, with an orange divider every 4 rows; export as PNG long
   image / paged images / PDF / MIDI / `.smc`
+- **Piano-audio MP3 export**: sheets that came from score music play every note of the original
+  (no 15-key compression, missing OMR notes patched by legato); sheets that came from audio
+  play the 15-key version on screen
+- Rename the result — both the title and `曲名:[...]` inside the sheet change
 - Change parameters and re-arrange without re-transcribing: tempo (candidate values are one
   click away), notes per slot, melody only, separate the hands, register
 - Register (`--octave`): `off` writes what you hear / `auto` shifts the notation up a level
@@ -121,7 +127,7 @@ semitones above a root.
 | 128 kbps mono + noise floor + clipping | **97.7** (only 0.5 points below clean) |
 | Reverb rt ≤ 1.0 s | 92.5; rt 1.5 s falls off a cliff to 77.2 — heavy reverb clearly costs accuracy |
 | Sheet music as **MusicXML** | ~78% of source notes recovered, **100% precision** (it would rather omit than guess) |
-| Sheet music as **photo/PDF** | ⚠️ prototype: 9.3–20.4% of notes are cut to fit 3-note slots; time and key signatures can be misread |
+| Sheet music as **image / PDF** | homr OMR, 5–9 s per page; the result is replayed as piano audio and transcribed again, so missed notes come back at that stage |
 | Wrong tempo estimate | collapses the whole piece (1.2% off is nearly total failure), hence the click-to-retry tempo candidates in the UI |
 
 (Benchmarks use an in-house dataset that is not distributed with the repo.)
@@ -138,14 +144,11 @@ sky15/tools/      utilities: MIDI rendering, sample generation
 
 ## Known limitations
 
-- **OMR (photos / PDF / screenshots of scores) is a prototype and not pleasant to use.**
-  It relies on the open-source Audiveris, itself a 300+ MB Java program; most images need
-  2× upscaling first (about 15 s per page). Recognised notes often pile 4–9 on one instant,
-  while a 15-key slot holds only 3, so notes must be cut to fit (20.4% at 1×, 9.3% at 2×) —
-  those cuts are exactly the missing notes you hear. About **78%** of source notes actually
-  land on keys (89% at 2×, at 100% precision); time and key signatures are sometimes misread
-  (one 2/4 score came out as 3/4); repeats, D.C. and grace notes are handled incompletely.
-  **For engraved scores, use MusicXML.**
+- **Images must be staff notation**: jianpu (numbered) notation, 15-key game screenshots and
+  ordinary photos are refused with an explicit reason. Photograph staff pages straight-on, with
+  no tilt or shadow; complex repeats, D.C. and grace notes get simplified.
+- OMR returns somewhat fewer notes than the original page, so the image path replays the score
+  as piano audio and transcribes that by default; for exact fidelity, feed MusicXML.
 - Screen recordings, heavy reverb and very quiet recordings degrade noticeably
   (`sky15.audioq` gives a health score first)
 - Only 3 notes can survive in a slot — that is the instrument's limit, not the algorithm's

@@ -60,6 +60,9 @@
       录音、录屏、MusicXML、还有本工具导出的 <code>.smc</code>，都能直接丢进来。
       一次拖好几个也行，会排队一个接一个转。
     </p>
+    <p class="empty-lead empty-sub">
+      图片只认<strong>五线谱</strong>（带五条横线的钢琴谱、歌曲谱）；简谱、光遇 15 键格子谱、照片一律不转。
+    </p>
     <div class="empty-actions">
       <button id="btn-pick" class="btn primary">选文件</button>
     </div>
@@ -131,7 +134,13 @@
 
     <div class="res-head">
       <div class="res-title-wrap">
-        <h2 id="res-title">未命名</h2>
+        <div class="res-title-line">
+          <h2 id="res-title">未命名</h2>
+          <button id="btn-rename" class="icon-btn" title="给这首谱子改个名字">
+            <svg viewBox="0 0 16 16"><path d="M3 11.5L11 3.5l1.5 1.5-8 8H3zM10 4.5l1.5 1.5"/></svg>
+          </button>
+        </div>
+        <input id="res-rename" class="res-rename hidden" type="text" maxlength="40" aria-label="谱子名字">
         <div id="res-chips" class="chips"></div>
       </div>
       <div class="res-head-actions">
@@ -300,6 +309,7 @@
             <a id="dl-pdf" class="btn dl" download>PDF</a>
             <a id="dl-smc" class="btn dl" download>谱面文本 .smc</a>
             <a id="dl-midi" class="btn dl" download>MIDI</a>
+            <a id="dl-piano" class="btn dl" download>钢琴声 MP3</a>
             <button id="btn-copy-smc" class="btn">复制文本</button>
           </div>
         </div>
@@ -333,7 +343,7 @@
 </dialog>
 
 <input id="file" type="file" multiple hidden
-       accept=".smc,.wav,.mp3,.flac,.m4a,.aac,.ogg,.opus,.wma,.mp4,.mov,.mkv,.webm,.musicxml,.xml,.mxl,.pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp">
+       accept=".smc,.txt,.smt,.wav,.mp3,.flac,.m4a,.aac,.ogg,.opus,.wma,.mp4,.mov,.mkv,.webm,.musicxml,.xml,.mxl,.pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp">
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 

@@ -62,7 +62,8 @@
           throw {
             message: j.error || ('请求失败（' + r.status + '）'),
             advice: j.advice || [],
-            code: j.code || ''
+            code: j.code || '',
+            status: r.status
           };
         }
         return j;
@@ -580,7 +581,7 @@
     if (j.elapsed) bits.push('已用 ' + Math.round(j.elapsed) + ' 秒');
     if (j.quality && j.quality.ok) bits.push('录音 ' + j.quality.score + '/100');
     if (j.status === 'done' && j.result) {
-      bits.push((j.result.notes || 0) + ' 个音 / ' + (j.result.bars || 0) + ' 小节');
+      bits.push((j.result.notes || 0) + ' 个音 / ' + barCount(j.result) + ' 小节');
       if (j.result.backend) bits.push(backendName(j.result.backend));
     }
     note.textContent = bits.filter(Boolean).join(' · ');
@@ -622,24 +623,34 @@
 
   function cancelJob(id) {
     var j = S.jobs[id];
-    if (!j) return;
-    if (j.status === 'uploading') {  // 还在传，直接丢掉卡片
-      delete S.jobs[id];
-      S.order = S.order.filter(function (x) { return x !== id; });
-      paintJobs();
+    if (!j) {                       // 卡片上的 × 永远能关，不管服务端还认不认这个任务
+      dropCard(id);
       return;
     }
-    if (j.status === 'done') {
-      delete S.jobs[id];
-      S.order = S.order.filter(function (x) { return x !== id; });
-      paintJobs();
+    if (j.status === 'uploading') {  // 还在传，直接丢掉卡片
+      dropCard(id);
+      return;
+    }
+    // 已经结束（出错 / 完成 / 已取消）的卡片，× 就是「关掉」，不用问服务端。
+    // 以前这里会对已回收的任务发 cancel，服务端 404，弹「找不到这个任务」——关都关不掉。
+    if (j.status === 'done' || j.status === 'error' || j.status === 'cancelled') {
+      dropCard(id);
       return;
     }
     api('/api/cancel/' + id, { method: 'POST' }).then(function (r) {
       if (r.job) S.jobs[id] = r.job;
       paintJobs();
       toast('已请求取消：跑到一半的那一步算完就停');
-    }).catch(function (e) { toast(e.message, 'err'); });
+    }).catch(function (e) {
+      if (e.status === 404) { dropCard(id); return; }   // 服务端已经不认了，直接关
+      toast(e.message, 'err');
+    });
+  }
+
+  function dropCard(id) {
+    delete S.jobs[id];
+    S.order = S.order.filter(function (x) { return x !== id; });
+    paintJobs();
   }
 
   /* ================= 建议框 ================= */
@@ -696,6 +707,7 @@
     $('#result').hidden = false;
     $('#empty').classList.add('hidden');
     $('#res-title').textContent = r.title || job.name || '未命名';
+    $('#res-title').title = '点一下就能改名';
     renderChips(r, job);
     var adv = (r.advice && r.advice.length ? r.advice : job.advice) || [];
     var box = $('#res-advice');
@@ -735,13 +747,25 @@
     loadPages();
   }
 
+  /* 谱面「多少小节」有两种口径，必须统一成用户看得懂的那种：
+     SMC 里一小节固定 8 列（不管拍号），而 2/4 的一小节只有 4 列 —— 96 列对
+     2/4 来说是 24 小节，不是 12。以前芯片报 12、播放条报 24，看着像出错。 */
+  function barCount(r) {
+    if (!r) return 0;
+    var beats = parseInt(String(r.time_sig || '4/4').split('/')[0], 10) || 4;
+    var perBar = Math.max(1, beats * 2);
+    if (r.groups) return Math.max(1, Math.round(r.groups / perBar));
+    if (r.bars) return Math.max(1, Math.round(r.bars * 8 / perBar));
+    return 0;
+  }
+
   function renderChips(r, job) {
     var host = $('#res-chips');
     host.innerHTML = '';
     function tag(text, cls) { host.appendChild(mk('span', 'tag' + (cls ? ' ' + cls : ''), text)); }
     if (r.key_raw) tag(r.key_raw + ' 调', 'k');
     if (r.tempo) tag('速度 ' + r.tempo + ' · ' + (r.time_sig || '4/4'));
-    if (r.bars) tag((r.notes || 0) + ' 个音 / ' + r.bars + ' 小节');
+    if (r.bars) tag((r.notes || 0) + ' 个音 / ' + barCount(r) + ' 小节');
     if (r.seconds) tag('原曲约 ' + fmtTime(r.seconds));
     if (r.difficulty) tag('难度 ' + r.difficulty);
     if (r.confidence) {
@@ -820,6 +844,7 @@
     $('#dl-pdf').href = '/api/export/' + id + '?mode=pdf&' + expQuery() + v;
     $('#dl-smc').href = '/api/export/' + id + '?mode=smc' + v;
     $('#dl-midi').href = '/api/export/' + id + '?mode=midi' + v;
+    if ($('#dl-piano')) $('#dl-piano').href = '/api/export/' + id + '?mode=piano&v=' + S.rev;
     $('#dl-page').href = '/api/export/' + id + '?mode=page&page=' + S.page + '&' + expQuery() + v;
   }
 
@@ -1000,7 +1025,7 @@
       if (it.at) bits.push(it.at);
       if (it.tempo) bits.push('速度 ' + it.tempo);
       if (it.key_raw || it.key) bits.push((it.key_raw || it.key) + ' 调');
-      if (it.bars) bits.push(it.bars + ' 小节');
+      if (it.bars) bits.push(barCount(it) + ' 小节');
       if (it.notes) bits.push(it.notes + ' 音');
       sub.textContent = bits.join(' · ');
       main.appendChild(title);
@@ -1061,6 +1086,58 @@
       row.appendChild(acts);
       host.appendChild(row);
     });
+  }
+
+  function startResultRename() {
+    if (!S.job) return;
+    var h2 = $('#res-title'), inp = $('#res-rename');
+    if (!inp.classList.contains('hidden')) return;
+    inp.value = (S.job.result && S.job.result.title) || h2.textContent || '';
+    inp.maxLength = 40;
+    h2.classList.add('hidden');
+    inp.classList.remove('hidden');
+    inp.focus();
+    inp.select();
+    try { inp.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+    var done = false;
+    function close(keep) {
+      inp.classList.add('hidden');
+      h2.classList.remove('hidden');
+      inp.removeEventListener('blur', onBlur);
+      inp.removeEventListener('keydown', onKey);
+      if (keep) return;
+    }
+    function commit() {
+      if (done) return;
+      done = true;
+      var v = inp.value.trim();
+      var jid = S.job && S.job.id;
+      if (!jid || !v || v === h2.textContent) { close(); return; }
+      api('/api/history/' + jid + '/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: v })
+      }).then(function () {
+        close();
+        h2.textContent = v;                      // 立刻生效，不必等重画
+        if (S.job.result) S.job.result.title = v;
+        setScoreImage();                          // 谱面图上的标题跟着换
+        setDownloads();
+        toast('名字改好了', 'ok');
+        loadHistory();
+      }).catch(function (e) {
+        done = false;
+        toast(e.message, 'err');
+        close();
+      });
+    }
+    function onBlur() { commit(); }
+    function onKey(ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+      if (ev.key === 'Escape') { done = true; close(); }
+    }
+    inp.addEventListener('blur', onBlur);
+    inp.addEventListener('keydown', onKey);
   }
 
   function startRename(row, it) {
@@ -1204,6 +1281,10 @@
       player.pause();
     });
 
+    // 改名：结果面板直接点笔就能改（不用再翻历史）
+    $('#btn-rename').addEventListener('click', function () { startResultRename(); });
+    $('#res-title').addEventListener('dblclick', function () { startResultRename(); });
+
     // 导出
     $('#exp-theme').addEventListener('change', function () {
       prefs.expTheme = this.value; savePrefs();
@@ -1219,6 +1300,13 @@
         toast(big ? '正在生成文件，大谱子要等几秒' : '开始下载', 'ok');
       });
     });
+    if ($('#dl-piano')) {
+      $('#dl-piano').addEventListener('click', function () {
+        var n = (S.job && S.job.result && S.job.result.notes) || 0;
+        toast('正在用钢琴采样弹一遍' + (n ? '（' + n + ' 个音）' : '') +
+              '，生成好浏览器会自己开始下载', 'ok');
+      });
+    }
     $('#btn-score-text').addEventListener('click', function () {
       var pre = $('#smc-text');
       pre.hidden = !pre.hidden;

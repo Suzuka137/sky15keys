@@ -182,9 +182,35 @@ class Library:
 
 # ─────────────────────────── 事件来源 ───────────────────────────
 
+def events_from_smc_text(text: str) -> tuple[list[dict], str]:
+    """15 键谱文本 → 事件列表。网页那边谱子在内存里，没存成文件，走这个。"""
+    from . import layout, smc
+
+    meta = smc.parse_meta(text)
+    groups = smc.parse_groups(text)
+    key = str(meta.get("key") or "C")
+    root_name = key.split("(")[0].strip() or "C"
+    if root_name not in layout.KEYS:
+        root_name = "C"
+    has8vb = "(8vb)" in key.lower()
+    tempo = float(meta.get("tempo") or 100)
+    slot = 60.0 / tempo / 2
+    out = []
+    for i, g in enumerate(groups):
+        for c in g:
+            if c not in layout.CHARS:
+                continue
+            p = layout.char_pitch(c, root_name)   # 第二个参数要调名，不是 MIDI 号
+            if has8vb:
+                p -= 12
+            out.append({"pitch": p, "start": i * slot, "dur": slot * 0.98,
+                        "velocity": 88})
+    return out, f"15 键谱（{tempo} BPM，{key}）"
+
+
 def events_from(path: str | pathlib.Path) -> tuple[list[dict], str]:
     """把各种输入统一成 [{'pitch','start','dur','velocity'}]，单位秒。"""
-    from . import layout, midifile, musicxml, smc
+    from . import layout, midifile, musicxml, smc   # noqa: F401  (供下面的分支用)
 
     path = pathlib.Path(path)
     ext = path.suffix.lower()
@@ -205,26 +231,7 @@ def events_from(path: str | pathlib.Path) -> tuple[list[dict], str]:
         return ev, "MIDI"
 
     if ext in (".smc", ".txt"):
-        text = path.read_text(encoding="utf-8", errors="replace")
-        meta = smc.parse_meta(text)
-        groups = smc.parse_groups(text)
-        key = str(meta.get("key") or "C")
-        root_name = key.split("(")[0].strip() or "C"
-        if root_name not in layout.KEYS:
-            root_name = "C"
-        has8vb = "(8vb)" in key.lower()
-        tempo = float(meta.get("tempo") or 100)
-        slot = 60.0 / tempo / 2
-        out = []
-        for i, g in enumerate(groups):
-            chars = [c for c in g if c in layout.CHARS]
-            for c in chars:
-                p = layout.char_pitch(c, root_name)   # 第二个参数要调名，不是 MIDI 号
-                if has8vb:
-                    p -= 12
-                out.append({"pitch": p, "start": i * slot, "dur": slot * 0.98,
-                            "velocity": 88})
-        return out, f"15 键谱（{tempo} BPM，{key}）"
+        return events_from_smc_text(path.read_text(encoding="utf-8", errors="replace"))
 
     if ext in (".png", ".jpg", ".jpeg", ".pdf", ".webp", ".bmp"):
         from . import omr
@@ -299,7 +306,7 @@ def render(events: list[dict], lib: Library, gain: float = 1.0,
     return buf
 
 
-def write_wav(a: np.ndarray, out: pathlib.Path) -> None:
+def write_wav(a: np.ndarray, out: pathlib.Path) -> pathlib.Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     pcm = np.clip(a, -1.0, 1.0)
     data = (pcm * 32767.0).astype("<i2").tobytes()
@@ -308,6 +315,22 @@ def write_wav(a: np.ndarray, out: pathlib.Path) -> None:
         w.setsampwidth(2)
         w.setframerate(SR)
         w.writeframes(data)
+    return out
+
+
+_LIB: "Library | None" = None
+
+
+def lib() -> "Library":
+    """进程内共用一个采样库。
+
+    Library 内部按文件名做 LRU 解码缓存，每次新建都会把 48 个采样重新
+    ffmpeg 解一遍（约 1.5 秒）。服务里一段音频要连续弹好几次，所以共享。
+    """
+    global _LIB
+    if _LIB is None:
+        _LIB = Library()
+    return _LIB
 
 
 def to_mp3(wav: pathlib.Path, mp3: pathlib.Path, kbps: int = 192) -> None:

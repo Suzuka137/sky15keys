@@ -174,6 +174,8 @@ main {
 .ea-dot { fill: currentColor; opacity: .45; }
 .empty h1 { font-size: clamp(1.4rem, 4vw, 1.9rem); }
 .empty-lead { max-width: 33rem; color: var(--ink2); margin: .4rem 0 1rem; }
+.empty-lead.empty-sub { font-size: .86rem; margin: -.4rem 0 1rem; opacity: .82; }
+.empty-lead.empty-sub strong { color: var(--ink); font-weight: 600; }
 .empty-warn {
   max-width: 36rem; margin: 0 0 1.2rem; padding: .6rem .85rem;
   border-radius: .7rem; font-size: .84rem; line-height: 1.6;
@@ -325,6 +327,17 @@ select.tiny { height: 2.1rem; font-size: .82rem; }
 .res-head { display: flex; align-items: flex-start; gap: .75rem; flex-wrap: wrap; margin-bottom: .7rem; }
 .res-title-wrap { flex: 1; min-width: 12rem; }
 .res-head-actions { display: flex; gap: .4rem; flex: none; }
+/* 标题行：名字 + 改名小笔 */
+.res-title-line { display: flex; align-items: center; gap: .3rem; }
+#res-title { cursor: pointer; }
+#btn-rename { opacity: .45; transition: opacity .15s; }
+#btn-rename:hover { opacity: 1; color: var(--brand); }
+.res-rename {
+  width: 100%; max-width: 26rem; font: inherit; font-size: 1.15rem; font-weight: 700;
+  padding: .3rem .55rem; border-radius: .5rem; color: var(--ink);
+  background: var(--card2); border: 1px solid var(--brand);
+  outline: none;
+}
 .chips { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .35rem; }
 .tag {
   font-size: .78rem; padding: .16rem .55rem; border-radius: 999px;

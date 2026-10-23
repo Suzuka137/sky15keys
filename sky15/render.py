@@ -350,8 +350,14 @@ def render_pages(text, **opt):
         # ---------- 页脚：左信息 / 中小字说明 / 右页码 ----------
         fy = page_h - margin + px(4)
         diff = str(meta.get("difficulty", "") or "")
+        # 页脚的小节数按**拍号**算，不按 SMC 的 8 列一格：
+        # 2/4 的一小节只有 4 列，96 列是 24 小节而不是 12，
+        # 页面上的「第 N / 24 小节」也是这个口径，两处必须一致。
+        _b = str(meta.get("time_sig", "4/4")).split("/")[0]
+        _per = max(1, (int(_b) if _b.isdigit() else 4) * 2)
+        bars_shown = max(1, round(len(p["bars"]) * 8 / _per))
         left = (f"{meta.get('tempo', 120)} BPM · {meta.get('time_sig', '4/4')} · "
-                f"{len(groups)} 格 · {len(p['bars'])} 小节")
+                f"{len(groups)} 格 · {bars_shown} 小节")
         if diff:
             left += f" · 难度 {diff}"
         d.text((margin, fy), left, font=f_foot, fill=o["dim"])

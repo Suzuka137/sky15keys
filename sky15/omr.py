@@ -32,6 +32,15 @@ TARGET_INTERLINE = 18
 BITMAP_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 PDF_EXT = (".pdf",)
 
+#: 环境变量：指向 homr.exe（可选引擎）
+HOMR_ENV = "SKY15_HOMR"
+#: homr 的常见安装位置（找不到才需要设 SKY15_HOMR）
+HOMR_CANDIDATES = (
+    r"E:\ai\workspace\.engines\homr-venv\Scripts\homr.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\sky15\homr\Scripts\homr.exe"),
+    os.path.expandvars(r"%USERPROFILE%\sky15\homr\Scripts\homr.exe"),
+)
+
 
 # ---------------------------------------------------------------- 引擎发现
 def find_audiveris():
@@ -921,6 +930,225 @@ def to_musicxml(image_path, outdir=None, timeout=600, extra_env=None,
             step("多页产物已合并", {"mxl": str(merged), "pages": len(got)})
             return merged
     return got[0]
+
+
+def find_homr():
+    """找 homr 可执行文件。找不到返回 None。
+
+    homr (github.com/liebharc/homr) 是 2024-2025 年的新 OMR：分割网络用
+    oemer 的 UNet，节奏/拍号/小节切分换成 TrOMR transformer。实测同一张
+    钢琴谱，它能把拍号读对（Audiveris 根本没识别出拍号符号）、小节数对、
+    覆盖率 100%，纯 CPU 6~7 秒。
+    """
+    env = os.environ.get(HOMR_ENV)
+    if env and pathlib.Path(env).exists():
+        return pathlib.Path(env)
+    for p in HOMR_CANDIDATES:
+        if pathlib.Path(p).exists():
+            return pathlib.Path(p)
+    got = shutil.which("homr")
+    return pathlib.Path(got) if got else None
+
+
+def homr_available() -> bool:
+    return find_homr() is not None
+
+
+def _homr_run_root() -> pathlib.Path:
+    """homr 的运行目录。
+
+    必须在工作区里、不能用系统 %TEMP%：rapidocr 会把 OCR 用的中间图
+    `page_tesseract_input.png` 写在自己的 cwd 下再去读，在 Windows 的
+    %TEMP% 里这一步会失败（实测三种 cwd 全报 LoadImageError，同一张图
+    放到工作区就正常）。所以统一落在 `sky15/out/.homr_run/`。
+    """
+    root = pathlib.Path(__file__).resolve().parent / "out" / ".homr_run"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        root = pathlib.Path(tempfile.gettempdir()) / "sky15_homr_run"
+        root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def to_musicxml_homr(image_path, outdir=None, timeout=420, on_step=None):
+    """图片 → MusicXML（用 homr）。
+
+    homr 只会把 xml 写在图片旁边，所以先把图复制成纯 ascii 名字（它用
+    cv2.imread 读图，中文路径会失败），跑完再搬回来。
+    """
+    exe = find_homr()
+    if not exe:
+        raise RuntimeError(
+            "没找到 homr。装法：\n"
+            "  python -m venv %LOCALAPPDATA%\\sky15\\homr\n"
+            "  %LOCALAPPDATA%\\sky15\\homr\\Scripts\\python.exe -m pip install \"homr[cpu]\"\n"
+            "  %LOCALAPPDATA%\\sky15\\homr\\Scripts\\homr.exe --init   # 下 157 MB 模型\n"
+            "然后用环境变量 SKY15_HOMR 指向 homr.exe。")
+    src = pathlib.Path(image_path)
+    if not src.exists():
+        raise FileNotFoundError(src)
+    outdir = pathlib.Path(outdir or tempfile.mkdtemp(prefix="sky15_homr_"))
+    outdir.mkdir(parents=True, exist_ok=True)
+    step = on_step or (lambda *a, **k: None)
+    td = _homr_run_root() / f"r{int(time.time() * 1000) % 10 ** 9}"
+    td.mkdir(parents=True, exist_ok=True)
+    try:
+        work = td / "page.png"
+        if src.suffix.lower() in PDF_EXT:
+            imgs = pdf_to_images(src, td, dpi=400, last=1)
+            shutil.copyfile(imgs[0], work)
+        elif src.suffix.lower() != ".png":
+            from PIL import Image
+            Image.open(src).convert("RGB").save(work)
+        else:
+            shutil.copyfile(src, work)
+        step("homr 识别中", {})
+        t0 = time.time()
+        proc = subprocess.run([str(exe), str(work)], capture_output=True,
+                              text=True, timeout=timeout, cwd=str(td),
+                              encoding="utf-8", errors="replace")
+        dt = time.time() - t0
+        made = sorted(td.glob("*.musicxml"))
+        if not made:
+            raise RuntimeError(
+                f"homr 跑完了但没出 MusicXML（返回码 {proc.returncode}，{dt:.1f}s）\n"
+                f"{(proc.stderr or proc.stdout or '')[-700:].strip()}")
+        dst = outdir / (src.stem + "_homr.musicxml")
+        shutil.copyfile(made[0], dst)
+        step(f"homr 完成（{dt:.1f}s）", {"sec": round(dt, 1)})
+        return dst
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _cover_of_events(ev) -> float:
+    """有音时间占比（10ms 网格）。识谱好不好的第一判据。"""
+    if not ev:
+        return 0.0
+    last = max(float(e["start"]) + float(e.get("dur") or 0) for e in ev)
+    if last <= 0:
+        return 0.0
+    n = int(last / 0.01) + 2
+    grid = bytearray(n)
+    for e in ev:
+        a = max(0, int(float(e["start"]) / 0.01))
+        b = min(n, int((float(e["start"]) + float(e.get("dur") or 0)) / 0.01))
+        for i in range(a, b):
+            grid[i] = 1
+    return sum(grid) / n
+
+
+def score_musicxml(path) -> dict:
+    """给一份 MusicXML 打分，用来在同一张图的多次识别里挑最好的一份。
+
+    三个判据（都有实测依据）：
+      cover      有音时间占比。覆盖率一塌，听感就是「断断续续」。
+      onset_rate 每秒起音点。把小节线读错会把整首拉长（实测同一张图
+                 4/4 读出 67.8s、2/4 读出 28.5s，同一页音乐），拉长后
+                 起音速率明显变低，这是最便宜的「被拉伸」探针。
+      notes      音数，只做极小的 tie-break。
+    """
+    from . import musicxml
+    got = musicxml.parse_full(str(path))
+    ev = got.to_seconds()
+    cov = _cover_of_events(ev)
+    last = max((float(e["start"]) + float(e.get("dur") or 0) for e in ev),
+               default=0.0)
+    ons = len({round(float(e["start"]), 3) for e in ev})
+    rate = ons / last if last > 0 else 0.0
+    score = cov + min(rate, 8.0) / 8.0 * 0.03 + min(len(ev), 4000) / 4000 * 0.02
+    return {"notes": len(ev), "cover": round(cov, 4),
+            "onset_rate": round(rate, 2), "dur": round(last, 1),
+            "time_sig": got.time_sig, "key": got.key, "tempo": got.tempo,
+            "score": round(score, 5)}
+
+
+def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
+                     scorer=None, on_step=None, engines=("homr",), **kw):
+    """图片 → MusicXML，多个引擎/多个放大倍数都跑一遍，取最好的那份。
+
+    默认只用 homr（2026-10-23 用户定的：只留 homr，Audiveris 从识别流程里撤掉）。
+    实测同一张 1439×1797 的钢琴谱：
+      homr      原尺寸  249 音、2/4 拍号读对、覆盖 99.9%、26.7 秒、6~8 秒跑完
+      Audiveris 原尺寸 317 音、覆盖 99.5%，但拍号一个都没认出来，整首拉长到 67.8 秒
+      Audiveris 放大 2× 只剩 231 音、覆盖 71.6%
+    Audiveris 留着只为兼容老脚本：engines=("audiveris",) 能显式点名。
+
+    参数
+      engines  要试的引擎，默认 ("homr",)——没装就报错，不悄悄降级
+      scales   Audiveris 的放大倍数（默认引擎下用不到）
+      scorer   回调 (mxl_path) -> dict，含 `score` 键，越大越好
+    返回
+      (最好的 mxl 路径, 明细 dict)
+    """
+    src = pathlib.Path(image_path)
+    if not src.exists():
+        raise FileNotFoundError(src)
+    outdir = pathlib.Path(outdir or tempfile.mkdtemp(prefix="sky15_omr_"))
+    outdir.mkdir(parents=True, exist_ok=True)
+    step = on_step or (lambda *a, **k: None)
+
+    def _score(p):
+        if scorer is not None:
+            return scorer(p)
+        return score_musicxml(p)
+
+    if engines is None:
+        engines = ("homr",)
+    engines = tuple(engines)
+    if "homr" in engines and not homr_available():
+        raise RuntimeError(
+            "没找到 homr（现在只用它识谱）。装法：\n"
+            "  python -m venv %LOCALAPPDATA%\\sky15\\homr\n"
+            "  %LOCALAPPDATA%\\sky15\\homr\\Scripts\\python.exe -m pip install \"homr[cpu]\"\n"
+            "  %LOCALAPPDATA%\\sky15\\homr\\Scripts\\homr.exe --init\n"
+            "然后用环境变量 SKY15_HOMR 指向 homr.exe。")
+
+    tries, best = [], None
+
+    def _try(tag, engine, fn):
+        nonlocal best
+        try:
+            step(f"识别（{tag}）", {"engine": engine})
+            mx = fn()
+            info = _score(mx)
+            info.update(engine=engine, tag=tag, mxl=str(mx))
+            tries.append(info)
+            step(f"{tag}：{info.get('notes')} 音 {info.get('time_sig')}，覆盖 "
+                 f"{100 * info.get('cover', 0):.1f}%", info)
+            if best is None or info["score"] > best["score"]:
+                best = info
+        except Exception as exc:                    # 某一档失败不该整体失败
+            tries.append({"tag": tag, "engine": engine,
+                          "error": f"{type(exc).__name__}: {exc}"})
+            step(f"{tag} 失败：{type(exc).__name__}", {})
+
+    if "homr" in engines:
+        _try("homr", "homr",
+             lambda: to_musicxml_homr(src, outdir / "s_homr", on_step=step))
+
+    # homr 读得很干净就直接交卷，不再花 30~40 秒把 Audiveris 跑四遍。
+    # 判据：覆盖率 ≥99.5% 且起音速率在 1.5~8/s（速率过低是被拉伸，过高是虚音）。
+    early = (best is not None and best.get("engine") == "homr"
+             and best.get("cover", 0) >= 0.995
+             and 1.5 <= best.get("onset_rate", 0) <= 8.0)
+    if early:
+        step("homr 读得够干净，跳过其他引擎", {})
+    elif "audiveris" in engines:
+        for sc in scales:
+            tag = "audiveris-auto" if sc is None else f"audiveris-x{sc:g}"
+            _try(tag, "audiveris",
+                 (lambda sc=sc, tag=tag: to_musicxml(
+                     src, outdir=outdir / f"s_{tag}", upscale=sc, **kw)))
+
+    if best is None:
+        raise RuntimeError("所有识别都失败了：\n" + "\n".join(
+            f"  · {t.get('tag')}: {t.get('error', '')[:200]}" for t in tries))
+    best["tries"] = [{k: v for k, v in t.items() if k != "mxl"} for t in tries]
+    step(f"选用 {best['engine']}（覆盖 {100 * best['cover']:.1f}%，"
+         f"{best['notes']} 音）", best)
+    return pathlib.Path(best["mxl"]), best
 
 
 def to_smc(image_path, **kw):
