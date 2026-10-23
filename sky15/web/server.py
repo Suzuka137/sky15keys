@@ -193,6 +193,18 @@ def _bool(v, default=True):
     return default
 
 
+def _chord_mode(v):
+    """调参里的「和弦」开关：`auto` 原样 / `duo` 双音。
+
+    双音 = 只给「一个高音 + 一个低音」的格子补一个低音区的和弦音，
+    具体怎么挑在 `arrange._chord_density` 里（含禁配表）。
+    """
+    s = str(v or "").strip().lower()
+    if s in ("duo", "2", "double", "双音", "两音", "加和弦"):
+        return "duo"
+    return "auto"
+
+
 def _pretty_title(name: str) -> str:
     """文件名 → 曲名：去扩展名、去下划线/连字符堆、去掉常见的机器后缀。"""
     stem = os.path.splitext(os.path.basename(name or ""))[0]
@@ -823,7 +835,8 @@ def do_rearrange(job, p: dict) -> dict:
                   else "mel" if octv in ("mel", "melody", "只抬旋律", "2")
                   else "off" if octv in ("off", "none", "0")
                   else "auto")
-    hs = {"on": True, "off": False}.get(chords, "auto")
+    hs = "auto"                       # 左右手自动分，开关交给 chord_mode
+    chord_mode = _chord_mode(chords)
     title = (p.get("title") or prev.get("title") or "未命名").strip() or "未命名"
 
     conf, grid, doubled, hit = "手动", "", 0, 1.0
@@ -874,7 +887,7 @@ def do_rearrange(job, p: dict) -> dict:
     tempo = int(_clamp(int(tempo or 120), 20, 400))
     text = A.arrange(events, tempo=tempo, time_sig=time_sig, key=key, title=title,
                      offset=phase, warp=warp, harmony=harmony, max_notes=max_notes,
-                     hand_split=hs, octave_fit=octave_fit)
+                     hand_split=hs, chord_mode=chord_mode, octave_fit=octave_fit)
     params = {"tempo": tempo, "key": key or "", "harmony": harmony,
               "max_notes": max_notes, "chords": chords, "octave": octv,
               "backend": prev.get("backend") or ""}
@@ -939,8 +952,7 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
                          title=_pretty_title(job.get("name") or ""), offset=0.0,
                          harmony=_bool(opts.get("harmony"), True),
                          max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
-                         hand_split={"on": True, "off": False}.get(
-                             (opts.get("chords") or "auto").lower(), "auto"),
+                         hand_split="auto", chord_mode=_chord_mode(opts.get("chords")),
                          octave_fit=(lambda o: "force" if o in ("high", "up", "+12", "高八度", "1")
                                      else "mel" if o in ("mel", "melody", "只抬旋律", "2")
                                      else "off" if o in ("off", "none", "0")
@@ -1016,8 +1028,7 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
                      title=_pretty_title(job.get("name") or ""), offset=phase,
                      harmony=_bool(opts.get("harmony"), True),
                      max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
-                     hand_split={"on": True, "off": False}.get(
-                         (opts.get("chords") or "auto").lower(), "auto"),
+                     hand_split="auto", chord_mode=_chord_mode(opts.get("chords")),
                      octave_fit=(lambda o: "force" if o in ("high", "up", "+12", "高八度", "1")
                                  else "mel" if o in ("mel", "melody", "只抬旋律", "2")
                                  else "off" if o in ("off", "none", "0")
@@ -1254,8 +1265,7 @@ def _run_score(job):
                      warp=warp,
                      harmony=_bool(opts.get("harmony"), True),
                      max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
-                     hand_split={"on": True, "off": False}.get(
-                         (opts.get("chords") or "auto").lower(), "auto"))
+                     hand_split="auto", chord_mode=_chord_mode(opts.get("chords")))
     job["_cache"] = {"timebase": "beats", "events": events, "tempo": tempo,
                      "time_sig": time_sig,
                      "tempo_map": list(getattr(parsed, "tempo_map", None) or [])}
@@ -1436,8 +1446,7 @@ def _run_omr(job):
                      warp=warp,
                      harmony=_bool(opts.get("harmony"), True),
                      max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
-                     hand_split={"on": True, "off": False}.get(
-                         (opts.get("chords") or "auto").lower(), "auto"))
+                     hand_split="auto", chord_mode=_chord_mode(opts.get("chords")))
     job["_cache"] = {"timebase": "beats", "events": events, "tempo": tempo,
                      "time_sig": time_sig,
                      "tempo_map": list(getattr(parsed, "tempo_map", None) or [])}

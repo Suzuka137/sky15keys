@@ -484,6 +484,74 @@ def _fold_melody(chars, prev_idx, max_gap, order=None):
     return chars
 
 
+# 「双音」档：要加的那个和弦音必须是低音区（不带点的 1~7），
+# 且与格里已有的数字不能凑成下面这些音程（用户 2026-10-23 指定）：
+#   12 23 34 45 67（相邻二度）· 17 27（七度）· 16（三全音方向）
+# 注意：这里比的是**数字**（忽略上方点），因为用户举的例子是「点3 配 2」。
+_DUO_BAD = {(1, 2), (2, 3), (3, 4), (4, 5), (6, 7),
+            (1, 7), (2, 7), (1, 6), (2, 6)}
+
+
+def _digit(char):
+    """15 键字符 → 简谱数字 1~7（忽略八度点）。"""
+    i = layout.CHARS.index(char)
+    return (i + 1) if i < 7 else (i - 6)
+
+
+def _chord_density(chars, mode, root, max_notes=3):
+    """调参里的「和弦」开关，只加陪衬音，绝不改动已经在格里的音。
+
+    auto   : 原样（转谱听到几个写几个）。
+    duo    : 只处理"一个高音 + 一个低音"（如 `点3` 配 `2`）的格子——再补一个
+             **低音区**（不带点）的和弦音，让它变成三个音。
+             以下情况一律不加：
+               · 只有一个数字（单个高音 / 单个低音）
+               · 两个数字都是低音（35、47 这种本来就成型的）
+               · 两个都是高音（没有低音垫底，加了会糊）
+               · 挑不出不犯禁的音（见 `_DUO_BAD`）
+    """
+    if not chars or len(chars) != 2:
+        return chars
+    hi = [c for c in chars if layout.CHARS.index(c) >= 7]
+    lo = [c for c in chars if layout.CHARS.index(c) < 7]
+    if len(hi) != 1 or len(lo) != 1:
+        return chars          # 只有"一高一低"才加
+    if (max_notes or 3) < 3:
+        return chars
+    have = [_digit(c) for c in chars]
+    # 注意：这里只约束**新加的那个音**与格里已有数字的关系，不管已有两个音之间。
+    # 用户举的例子「点3 配 2」本身数字就是 2-3，所以"已有组合犯禁就不加"这条
+    # 会把该加的情况也挡掉——实测过，是错的读法。
+    lo_i = layout.CHARS.index(lo[0])
+    best = None
+    for j in range(7):                     # 只从低音行 1~7 里挑
+        d = j + 1
+        if agreements_bad(d, have):
+            continue
+        # 和已有的低音构成纯五/纯四/三度最好；同音（八度叠）也留作兜底
+        semi = abs(layout.OFFSET_OF[layout.CHARS[j]] - layout.OFFSET_OF[lo[0]])
+        good = {7: 0, 5: 1, 4: 2, 3: 3, 0: 4}.get(semi, 9)
+        key = (good, abs(j - lo_i))
+        if best is None or key < best[0]:
+            best = (key, j)
+    if best is None:
+        return chars
+    add = layout.CHARS[best[1]]
+    if add in chars:
+        return chars
+    return chars + [add]
+
+
+def agreements_bad(d, have):
+    """新数字 d 与格里已有数字是否凑成禁配。"""
+    for h in have:
+        if h == d:
+            continue
+        if (min(h, d), max(h, d)) in _DUO_BAD:
+            return True
+    return False
+
+
 def arrange(events, tempo=120, time_sig="4/4", key=None, title="",
             difficulty=None, has8vb=None, max_notes=3,
             key_mode="fit", mel_mode="long", bass_mode="strong", harmony=True,
@@ -494,6 +562,7 @@ def arrange(events, tempo=120, time_sig="4/4", key=None, title="",
             mel_hi_only=False,
             mel_fold=0.0,
             lh_m21=False, lh_conf_min=0.55, lh_synth=False, tempo_exact=None,
+            chord_mode="auto",
             # 注意：库里默认 off（评测要跟真值逐字可比）；
             # 网页/命令行给用户出谱时走 auto —— 常见写法"唱名写高 + (8vb)"。
             octave_fit="off"):
@@ -712,8 +781,7 @@ def arrange(events, tempo=120, time_sig="4/4", key=None, title="",
                                     if bar_chords is not None else None),
                              chord_conf_min=lh_conf_min, lh_synth=lh_synth)
         if picked:
-            prev_mel = max(n["pitch"] for n in picked)
-        # 站上的写法：同一格里**高音在前、低音在后**（如 `1D` 而非 `D1`）
+            prev_mel = max(n["pitch"] for n in picked)        # 站上的写法：同一格里**高音在前、低音在后**（如 `1D` 而非 `D1`）
         picked.sort(key=lambda n: n["pitch"], reverse=True)
         # 音区：只把每格最高的那个音抬一个八度（左手/低音不动）。
         # 这是那些人工谱最常见的编法——旋律在高音行（带点），根音留在低音行。
@@ -730,6 +798,10 @@ def arrange(events, tempo=120, time_sig="4/4", key=None, title="",
             if c not in chars:                     # 同一格不能按同一个键两次
                 chars.append(c)
         if chars:
+            # 「双音」：只给"一个高音 + 一个低音"的格子补一个低音区和弦音。
+            # 主旋律（最高那个音）一格都不动，只在下面垫一个音。
+            if chord_mode not in ("auto", "", None):
+                chars = _chord_density(chars, chord_mode, root, max_notes)
             # 旋律八度折叠：只改八度、不改音名，让旋律别上下乱蹦（见 _fold_melody）
             if mel_fold:
                 before = chars[0]
