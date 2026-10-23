@@ -22,6 +22,7 @@
 
     set SKY15_AUDIVERIS=D:\\Audiveris\\Audiveris.exe
 """
+from .tmp import tmpdir, tmpfile
 import os, pathlib, shutil, subprocess, sys, tempfile, math, re, time
 
 # Audiveris 的硬上限：总像素超过约 16M 时会 Exit forced（内存/图幅），不是"慢一点"
@@ -757,7 +758,7 @@ def merge_musicxml(paths, out_path=None, warn=None):
         root.append(p)
     ET.indent(root, space="  ") if hasattr(ET, "indent") else None
     out_path = pathlib.Path(out_path) if out_path else \
-        pathlib.Path(tempfile.mkdtemp(prefix="sky15_merge_")) / "merged.musicxml"
+        tmpdir("sky15_merge") / "merged.musicxml"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(str(out_path), encoding="utf-8", xml_declaration=True)
     return out_path
@@ -857,7 +858,7 @@ def to_musicxml(image_path, outdir=None, timeout=600, extra_env=None,
     src = pathlib.Path(image_path)
     if not src.exists():
         raise FileNotFoundError(src)
-    outdir = pathlib.Path(outdir or tempfile.mkdtemp(prefix="sky15_omr_"))
+    outdir = pathlib.Path(outdir or tmpdir("sky15_omr"))
     outdir.mkdir(parents=True, exist_ok=True)
     step = on_step or (lambda *a, **k: None)
 
@@ -997,7 +998,7 @@ def to_musicxml_homr(image_path, outdir=None, timeout=420, on_step=None,
     src = pathlib.Path(image_path)
     if not src.exists():
         raise FileNotFoundError(src)
-    outdir = pathlib.Path(outdir or tempfile.mkdtemp(prefix="sky15_homr_"))
+    outdir = pathlib.Path(outdir or tmpdir("sky15_homr"))
     outdir.mkdir(parents=True, exist_ok=True)
     step = on_step or (lambda *a, **k: None)
     td = _homr_run_root() / f"r{int(time.time() * 1000) % 10 ** 9}"
@@ -1119,7 +1120,7 @@ def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
     src = pathlib.Path(image_path)
     if not src.exists():
         raise FileNotFoundError(src)
-    outdir = pathlib.Path(outdir or tempfile.mkdtemp(prefix="sky15_omr_"))
+    outdir = pathlib.Path(outdir or tmpdir("sky15_omr"))
     outdir.mkdir(parents=True, exist_ok=True)
     step = on_step or (lambda *a, **k: None)
 

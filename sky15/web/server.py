@@ -60,11 +60,27 @@ from sky15.web import midiout, scoreio
 
 VERSION = "2.0"
 
+
+def log(msg):
+    """一句话日志。
+
+    以前这些分支里直接写 `log(...)` 但全文件根本没有定义 log —— 平时走不到，
+    一走到就是 `name 'log' is not defined`，把真正的失败原因盖掉了
+    （PhotoScore 那次就是这样：引擎那边只说了一句日志未定义）。
+    """
+    try:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    except Exception:
+        pass
+
+
 OUT = ROOT / "out"
 JOBS_DIR = OUT / "web_jobs"
 CACHE_DIR = OUT / "web_cache"
 HIST_FILE = OUT / "web_history.json"
-WORK = Path(tempfile.gettempdir()) / "sky15_web"
+# 上传的原始文件不放 %TEMP%（那是 C 盘，几十 MB 的视频一存就好几百兆）。
+# 统一放到 out/web_uploads，跟着项目一起在 E 盘。
+WORK = Path(os.environ.get("SKY15_WORK") or (OUT / "web_uploads"))
 for _d in (OUT, JOBS_DIR, CACHE_DIR, WORK):
     _d.mkdir(parents=True, exist_ok=True)
 
@@ -1251,6 +1267,10 @@ def _run_score(job):
 
     # 默认走「先弹成钢琴音频，再当音频转谱」（用户 2026-10-23 试听后点名要的）。
     # 关掉的办法：参数里 via_audio=off，或者犯错了随时改回来。
+    #
+    # 2026-10-23 试过「上传的本来就是 xml 时直读、不过音频」：同一份 PhotoScore
+    # xml 直读 211 音 / 走音频 212 音，差 1 个音等于没差，但用户明确希望所有输入
+    # 走同一条路（他怀疑差异来自流程），所以这里保持统一，不再按后缀分流。
     if _bool(opts.get("via_audio"), True):
         try:
             ev2, _bk = _sheet_to_audio_events(job, secs)

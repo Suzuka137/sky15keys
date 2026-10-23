@@ -101,6 +101,20 @@ def _extra_meta(text):
     }
 
 
+def _pretty_title(t):
+    """文件名是上传时生成的哈希/长串时，别把它印在谱面上。
+
+    典型情况：手机上拍的截图传上来叫 `725a0c0c6da513532f15b1e81116e762.jpg`，
+    曲名就被写成了这串字符。谱面上显示「未命名」，用户可以在网页上改名。
+    """
+    s = (t or "").strip()
+    if not s:
+        return "未命名"
+    if re.fullmatch(r"[0-9a-f]{16,}", s) or re.fullmatch(r"[A-Za-z0-9_\-]{20,}", s):
+        return "未命名"
+    return s
+
+
 def _lanes(n):
     """n 个音竖排时各占哪一条"轨"。
 
@@ -230,6 +244,7 @@ def _plan(text, opt):
 
 
 def render_pages(text, **opt):
+    footer_note = opt.pop("footer_note", "")
     p = _plan(text, opt)
     o, meta, groups = p["o"], p["meta"], p["groups"]
     rows, page_rows = p["rows"], p["page_rows"]
@@ -274,7 +289,7 @@ def render_pages(text, **opt):
         d = ImageDraw.Draw(img)
 
         # ---------- 页眉：标题居中，四角两行信息 ----------
-        title = meta.get("title") or "未命名"
+        title = _pretty_title(meta.get("title"))
         if not title.startswith("《"):
             title = f"《{title}》"
         if page_no == 0:
@@ -362,9 +377,11 @@ def render_pages(text, **opt):
             left += f" · 难度 {diff}"
         d.text((margin, fy), left, font=f_foot, fill=o["dim"])
 
-        note = "仅供个人学习研究使用，请勿商用"
-        d.text(((page_w - d.textlength(note, font=f_foot)) / 2, fy), note,
-               font=f_foot, fill=o["dim"])
+        # 页脚中间那句说明默认**不打印**（用户 2026-10-24 明确要求别在成品上带字样）。
+        # 需要时用 render_pages(..., footer_note="...") 传进来即可。
+        if footer_note:
+            d.text(((page_w - d.textlength(footer_note, font=f_foot)) / 2, fy), footer_note,
+                   font=f_foot, fill=o["dim"])
 
         pn = f"{page_no + 1} / {total_pages}"
         d.text((page_w - margin - d.textlength(pn, font=f_foot), fy), pn,

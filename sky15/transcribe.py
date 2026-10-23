@@ -8,6 +8,7 @@
 
 视频文件先经 ffmpeg 抽音轨。
 """
+from .tmp import tmpdir, tmpfile
 import os, shutil, subprocess, tempfile
 
 # ---------------------------------------------------------------- 转谱超参
@@ -49,7 +50,7 @@ def to_wav(path, sr=16000, mono=True):
     ff = _which_ffmpeg()
     if not ff:
         raise RuntimeError("需要 ffmpeg：把它放进 PATH（winget install Gyan.FFmpeg）")
-    out = os.path.join(tempfile.mkdtemp(prefix="sky15_"), "a.wav")
+    out = str(tmpfile("sky15", "a.wav"))
     cmd = [ff, "-y", "-loglevel", "error", "-i", path,
            "-ac", "1" if mono else "2", "-ar", str(sr), out]
     subprocess.run(cmd, check=True)
@@ -242,7 +243,7 @@ def _piano(wav, device=None, onset=None, offset=None, frame=None, pedal=None,
     tr.offset_threshold = OFFSET_TH if offset is None else float(offset)
     tr.frame_threshold = FRAME_TH if frame is None else float(frame)
     tr.pedal_offset_threshold = PEDAL_TH if pedal is None else float(pedal)
-    mid = os.path.join(tempfile.mkdtemp(prefix="sky15_"), "t.mid")
+    mid = str(tmpfile("sky15", "t.mid"))
     tr.transcribe(audio, mid)
     return _events_from_mido_midi(mid), None
 
@@ -332,7 +333,7 @@ def _basic(wav):
     import tempfile, os
 
     _model_out, midi_data, _notes = predict(wav, ICASSP_2022_MODEL_PATH)
-    mid = os.path.join(tempfile.mkdtemp(prefix="sky15_"), "t.mid")
+    mid = str(tmpfile("sky15", "t.mid"))
     midi_data.write(mid)
     return _events_from_mido_midi(mid), None
 

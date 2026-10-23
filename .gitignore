@@ -1,7 +1,0 @@
-__pycache__/
-*.pyc
-out/
-*.smc
-*.mid
-*.wav
-.env
