@@ -243,9 +243,13 @@ def cmd_doctor(a):
     try:
         import piano_transcription_inference as pti       # noqa: F401
         ck = pathlib.Path.home() / "piano_transcription_inference_data"
-        have = list(ck.glob("*.pth")) if ck.exists() else []
-        if have:
-            print(f"  piano_transcription_inference  已装，权重 {have[0].stat().st_size / 1024 / 1024:.0f} MB")
+        # 该目录可能有多个 .pth（如 gitcode.pth 仅 0.5 MB）；只认 >150 MB 的真权重，
+        # 判据与 transcribe.auto_backend 保持一致，否则会把占位文件报成「权重 0 MB」。
+        have = sorted((ck.glob("*.pth") if ck.exists() else []),
+                      key=lambda p: p.stat().st_size, reverse=True)
+        real = [p for p in have if p.stat().st_size > 150 * 1024 * 1024]
+        if real:
+            print(f"  piano_transcription_inference  已装，权重 {real[0].stat().st_size / 1024 / 1024:.0f} MB")
         else:
             print("  piano_transcription_inference  已装，但权重没下（首次使用会下 165 MB）")
     except Exception:                                         # noqa: BLE001
