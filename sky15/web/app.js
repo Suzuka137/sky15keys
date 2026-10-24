@@ -62,7 +62,7 @@
           throw {
             message: j.error || ('请求失败（' + r.status + '）'),
             advice: j.advice || [],
-            code: j.code || '',
+            code: j.code || j.hcode || '',
             status: r.status
           };
         }
@@ -82,10 +82,42 @@
     toastTimer = setTimeout(function () { t.className = 'toast'; }, kind === 'err' ? 5200 : 2600);
   }
 
+  // 站内确认框：Promise<bool>。用它替掉浏览器原生的 confirm（样式和站点对不上）
+  function uiConfirm(msg, yes, no) {
+    return new Promise(function (resolve) {
+      var mask = $('#modal-mask'), y = $('#modal-yes'), n = $('#modal-no');
+      if (!mask || !y || !n) { resolve(window.confirm(msg)); return; }
+      $('#modal-msg').textContent = msg;
+      y.textContent = yes || '确定';
+      n.textContent = no || '取消';
+      mask.hidden = false;
+      function done(v) {
+        mask.hidden = true;
+        y.removeEventListener('click', onYes);
+        n.removeEventListener('click', onNo);
+        mask.removeEventListener('click', onMask);
+        document.removeEventListener('keydown', onKey, true);
+        resolve(v);
+      }
+      function onYes() { done(true); }
+      function onNo() { done(false); }
+      function onMask(ev) { if (ev.target === mask) done(false); }
+      function onKey(ev) {
+        if (ev.key === 'Escape') { ev.stopPropagation(); done(false); }
+        else if (ev.key === 'Enter') { ev.stopPropagation(); done(true); }
+      }
+      y.addEventListener('click', onYes);
+      n.addEventListener('click', onNo);
+      mask.addEventListener('click', onMask);
+      document.addEventListener('keydown', onKey, true);
+      y.focus();
+    });
+  }
+
   /* ================= 偏好 ================= */
   var prefs = {
     theme: 'dark', fsIdx: 2, panelOpen: true,
-    expTheme: 'dark', expDpi: '150', rate: 1, metro: false
+    expTheme: 'dark', expDpi: '200', rate: 1, metro: false
   };
   (function () {
     var p = readPrefs();
@@ -767,7 +799,6 @@
     if (r.tempo) tag('速度 ' + r.tempo + ' · ' + (r.time_sig || '4/4'));
     if (r.bars) tag((r.notes || 0) + ' 个音 / ' + barCount(r) + ' 小节');
     if (r.seconds) tag('原曲约 ' + fmtTime(r.seconds));
-    if (r.difficulty) tag('难度 ' + r.difficulty);
     if (r.confidence) {
       var hit = r.hit == null ? null : Math.round(r.hit);
       var cls = r.confidence === '高' ? 'ok' : r.confidence === '低' ? 'warn' : '';
@@ -812,7 +843,7 @@
        谱面还是老音符、播放却是新音符，看起来就像"敲的和谱上写的不一样" */
     return '/api/export/' + S.job.id + '?mode=' + mode +
       (mode === 'page' ? '&page=' + clamp(S.page, 1, S.pages) : '') +
-      '&v=' + S.rev + '&' + expQuery(dpi ? { dpi: dpi } : { dpi: 150 });
+      '&v=' + S.rev + '&' + expQuery(dpi ? { dpi: dpi } : { dpi: 200 });
   }
 
   function setScoreImage() {
@@ -942,35 +973,56 @@
       var _o = $('#tune-octave');
       if (_o) body.octave = _o.value;
     }
-    api('/api/rearrange/' + S.job.id, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    }).then(function () {
-      return api('/api/job/' + S.job.id);
-    }).then(function (job) {
-      renderResult(job);
-      S.jobs[job.id] = job;
-      paintJobs();
-      var st = $('#tune-state');
-      st.className = 'tune-state ok';
-      st.textContent = '已按新参数重排，谱面是最新的';
-      toast('重排好了', 'ok');
-    }).catch(function (e) {
-      var st = $('#tune-state');
-      st.className = 'tune-state';
-      st.textContent = e.message;
-      if (e.advice && e.advice.length) {
-        var box = $('#res-advice');
-        box.innerHTML = '';
-        box.appendChild(adviceBox(e.message, e.advice, true));
-        box.classList.remove('hidden');
-      }
-      toast(e.message, 'err');
-    }).then(function () {
-      S.busy = false;
-      btn.classList.remove('busy');
-    });
+    send(false);
+
+    function send(force) {
+      var payload = {};
+      for (var k in body) payload[k] = body[k];
+      if (force) payload.force = true;
+      api('/api/rearrange/' + S.job.id, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).then(function () {
+        return api('/api/job/' + S.job.id);
+      }).then(function (job) {
+        renderResult(job);
+        S.jobs[job.id] = job;
+        paintJobs();
+        var st = $('#tune-state');
+        st.className = 'tune-state ok';
+        st.textContent = '已按新参数重排，谱面是最新的';
+        toast('重排好了', 'ok');
+      }).catch(function (e) {
+        // 手动改过的谱：重排会把手改的格子盖掉，先问一句再动手
+        if (e.code === 'edited' && !force) {
+          uiConfirm('这首谱你手动改过。\n重排会把手改的格子全部还原成自动结果，改过的内容找不回来。\n还要重排吗？', '重排', '算了')
+            .then(function (yes) {
+              if (yes) { send(true); return; }
+              var s0 = $('#tune-state');
+              s0.className = 'tune-state';
+              s0.textContent = '没有重排，你的改动还在';
+              S.busy = false;
+              btn.classList.remove('busy');
+            });
+          return;
+        }
+        var st = $('#tune-state');
+        st.className = 'tune-state';
+        st.textContent = e.message;
+        if (e.advice && e.advice.length) {
+          var box = $('#res-advice');
+          box.innerHTML = '';
+          box.appendChild(adviceBox(e.message, e.advice, true));
+          box.classList.remove('hidden');
+        }
+        toast(e.message, 'err');
+      }).then(function () {
+        S.busy = false;
+        btn.classList.remove('busy');
+      });
+    }
+    return;
   }
 
   /* ---------- 小节尺 ---------- */
@@ -1329,6 +1381,17 @@
         toast('这个浏览器不给复制权限，点「源码文本」手动选吧', 'err');
       }
     });
+    $('#btn-edit').addEventListener('click', function () {
+      var id = S.job && S.job.id;
+      if (!id) return;
+      if (S.job && S.job.status && S.job.status !== 'done') {
+        toast('等这首转完再改', 'warn');
+        return;
+      }
+      if (!window.SkyEditor) { toast('编辑器没加载出来，刷新页面试试', 'err'); return; }
+      window.SkyEditor.open(id, function () { openJob(id, true); });
+    });
+    // 弹出独立窗口：已按用户要求删除（2026-10-25）
     $('#pg-prev').addEventListener('click', function () { S.page = clamp(S.page - 1, 1, S.pages); paintPage(); });
     $('#pg-next').addEventListener('click', function () { S.page = clamp(S.page + 1, 1, S.pages); paintPage(); });
 
@@ -1497,6 +1560,17 @@
     });
     loadHistory();
 
+    // ?id=xxx —— 深链接直接打开某个作业
+    var qs = null;
+    try { qs = new URLSearchParams(location.search); } catch (e) { qs = null; }
+    var wantId = qs && qs.get('id');
+    if (wantId) {
+      openJob(wantId, true).catch(function () {
+        toast('这个任务不在了，重新传一次吧', 'err');
+      });
+      return;
+    }
+
     // 刷新后回到上次的结果页；先查历史确认这个 id 还在（服务重启过就没了），
     // 这样不会再往控制台喷一个 404。
     var last = null;
@@ -1521,5 +1595,6 @@
 
   // 给控制台留个把手，方便自己/验收脚本查状态
   window.SkyApp = { S: S, player: player, pad: pad, openJob: openJob, rerun: rerun, prefs: prefs,
+    uiConfirm: uiConfirm,
     onTick: onTick, scoreBase: scoreBase, padBase: padBase, idxOfMidi: idxOfMidi, midiOfIndex: midiOfIndex };
 })();

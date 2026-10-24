@@ -631,3 +631,109 @@ kbd {
   .score-box { max-height: none; overflow: visible; padding: 0; }
   body { background: #fff; }
 }
+
+/* ================= 谱面编辑器 ================= */
+body.ed-open { overflow: hidden; }
+.ed {
+  position: fixed; inset: 0; z-index: 90;
+  display: flex; flex-direction: column;
+  background: #0b0d12;
+  color: #e8ebf2;
+}
+.ed.hidden { display: none; }
+.ed-top {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid #1d2230;
+  background: #0e1117;
+}
+.ed-title { font-weight: 700; font-size: 15px; }
+.ed-sub { color: #8b93a7; font-size: 13px; }
+.ed-spacer { flex: 1; }
+.ed-lb { display: flex; align-items: center; gap: 6px; color: #8b93a7; font-size: 13px; }
+.ed-lb input {
+  width: 74px; padding: 5px 8px; border-radius: 8px;
+  border: 1px solid #2a3142; background: #131722; color: #e8ebf2;
+  font-size: 13px;
+}
+.ed-dirty { font-size: 12px; color: #6b7280; min-width: 48px; }
+.ed-dirty.warn { color: #ffd166; }
+
+.ed-body { flex: 1; display: flex; min-height: 0; }
+.ed-left { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.ed-stage {
+  flex: 1; overflow: auto; padding: 18px;
+  display: flex; justify-content: center; align-items: flex-start;
+}
+.ed-page { position: relative; width: 100%; max-width: 1000px; }
+.ed-page img { display: block; width: 100%; height: auto; border-radius: 8px; }
+.ed-page canvas {
+  position: absolute; left: 0; top: 0; cursor: pointer;
+}
+.ed-tools {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 16px; border-top: 1px solid #1d2230; background: #0e1117;
+}
+.ed-pageno { font-variant-numeric: tabular-nums; color: #8b93a7; font-size: 13px; }
+.ed-sep { width: 1px; height: 20px; background: #232a3a; margin: 0 4px; }
+
+.ed-right {
+  width: 400px; flex: 0 0 400px; border-left: 1px solid #1d2230;
+  padding: 16px; overflow-y: auto; background: #0e1117;
+}
+.ed-pad { margin: 4px 0 14px; }
+.ed-now { font-size: 13px; line-height: 1.9; color: #aab2c5; }
+.ed-now b { color: #e8ebf2; }
+.ed-editing { color: #ffd166; }
+.ed-hint { margin-top: 10px; font-size: 12px; line-height: 1.9; color: #667089; }
+
+@media (max-width: 900px) {
+  .ed-body { flex-direction: column; }
+  .ed-right { width: auto; flex: 0 0 auto; border-left: none; border-top: 1px solid #1d2230; }
+}
+
+/* ---------- 2026-10-25：悬停发光（主界面布局保持原样，不动） ---------- */
+.skykey:hover rect { filter: drop-shadow(0 0 9px color-mix(in srgb, var(--brand) 75%, transparent)); }
+.skykey.on rect { filter: drop-shadow(0 0 12px color-mix(in srgb, var(--brand) 85%, transparent)); }
+
+/* 编辑器：右边的 15 键面板竖直居中（以前贴在右上角） */
+.ed-right { display: flex; flex-direction: column; justify-content: center; }
+.ed-stage { justify-content: center; }
+.ed-page { margin: 0 auto; }
+/* ---------- 「弹出窗口」：独立小窗只留谱面 + 15 键面板 + 播放 ---------- */
+
+/* ---------- 提示条（toast）：字大一点 + 发光，原来太小看不清 ---------- */
+.toast {
+  font-size: 1rem; font-weight: 600; letter-spacing: .01em;
+  padding: .8rem 1.35rem;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--brand) 35%, transparent),
+              0 0 22px -4px var(--brand),
+              0 18px 44px -18px rgba(0, 0, 0, .85);
+  text-shadow: 0 0 12px color-mix(in srgb, var(--brand) 55%, transparent);
+}
+.toast.ok { border-color: var(--ok); box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 40%, transparent), 0 0 22px -4px var(--ok), 0 18px 44px -18px rgba(0,0,0,.85); }
+.toast.err { border-color: var(--err); box-shadow: 0 0 0 1px color-mix(in srgb, var(--err) 40%, transparent), 0 0 22px -4px var(--err), 0 18px 44px -18px rgba(0,0,0,.85); }
+.toast.warn { border-color: var(--warn); box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 40%, transparent), 0 0 22px -4px var(--warn), 0 18px 44px -18px rgba(0,0,0,.85); }
+/* ---------- 站内确认框（替代浏览器 confirm） ---------- */
+.modal-mask {
+  position: fixed; inset: 0; z-index: 90;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(4, 6, 10, .62); backdrop-filter: blur(3px);
+  padding: 1.2rem;
+}
+.modal-mask[hidden] { display: none !important; }
+.modal-card {
+  width: min(430px, 92vw);
+  background: var(--card, #141922);
+  border: 1px solid var(--line, #262d3a);
+  border-radius: 14px;
+  padding: 1.1rem 1.15rem .95rem;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .55);
+}
+.modal-msg {
+  font-size: .95rem; line-height: 1.7; color: var(--fg, #e8edf7);
+  white-space: pre-wrap; word-break: break-word;
+}
+.modal-acts {
+  display: flex; justify-content: flex-end; gap: .55rem; margin-top: 1rem;
+}

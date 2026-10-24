@@ -60,11 +60,29 @@ from sky15.web import midiout, scoreio
 
 VERSION = "2.0"
 
+
+def log(msg):
+    """一句话日志。
+
+    以前这些分支里直接写 `log(...)` 但全文件根本没有定义 log —— 平时走不到，
+    一走到就是 `name 'log' is not defined`，把真正的失败原因盖掉了
+    （PhotoScore 那次就是这样：引擎那边只说了一句日志未定义）。
+    """
+    try:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    except Exception:
+        pass
+
+
 OUT = ROOT / "out"
 JOBS_DIR = OUT / "web_jobs"
 CACHE_DIR = OUT / "web_cache"
+# 排版版本：改了 render.py 的观感（行数/字号/页眉）就 +1，让磁盘缓存失效。
+_REN_VER = "v8"
 HIST_FILE = OUT / "web_history.json"
-WORK = Path(tempfile.gettempdir()) / "sky15_web"
+# 上传的原始文件不放 %TEMP%（那是 C 盘，几十 MB 的视频一存就好几百兆）。
+# 统一放到 out/web_uploads，跟着项目一起在 E 盘。
+WORK = Path(os.environ.get("SKY15_WORK") or (OUT / "web_uploads"))
 for _d in (OUT, JOBS_DIR, CACHE_DIR, WORK):
     _d.mkdir(parents=True, exist_ok=True)
 
@@ -710,17 +728,32 @@ def _piano_gc(keep: int = 40):
 
 def _render_to(text: str, mode: str, theme: str = "dark", dpi: int = 150,
                page: int = 1, jid: str = "", title: str = "",
-               bars: int = 0) -> bytes:
+               bars: int = 0, rows: int = 0, crop: bool = False) -> bytes:
     """统一出口。mode: preview / long / page / pagefit / pages / pdf。带磁盘缓存。
-    bars>0 时按指定「一行几小节」排版（手机竖屏用 2，字能大一倍）。"""
+    bars>0 时按指定「一行几小节」排版（手机竖屏用 2，字能大一倍）。
+    rows>0 时按指定「一页几行」分页（默认 4）。
+    crop=True 时每页按本页实际内容裁掉下方空白（改谱子页面用）。"""
     theme = theme if theme in ("dark", "light") else "dark"
     dpi = int(_clamp(int(dpi or 150), 72, 400))
     bars = int(_clamp(int(bars or 0), 0, 8))
+    rows = int(_clamp(int(rows or 0), 0, 12))
     jid = jid or hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
     ck_mode = mode if not bars or bars == 4 else f"{mode}b{bars}"
+    # rows 只在"和默认不同"时才进缓存键；默认是一页 8 行（主界面），改谱子页面固定传 4
+    if rows and rows != 8:
+        ck_mode += f"r{rows}"
+    if crop:
+        ck_mode += "c"
+    # 排版版本号：改名/改行数/改字号这类"代码变了但参数没变"的情况，
+    # 缓存键必须跟着变，否则用户看到的还是旧图（2026-10-25 一页 8 行改 4 行踩过）。
+    ck_mode += "_" + _REN_VER
     ropt = {}
     if bars:
         ropt["bars_per_row"] = bars
+    if rows:
+        ropt["rows_per_page"] = rows
+    if crop:
+        ropt["crop"] = True
 
     ext = {"preview": "png", "long": "png", "page": "png", "pagefit": "png",
            "pages": "zip", "pdf": "pdf"}.get(mode, "png")
@@ -785,11 +818,13 @@ def _render_to(text: str, mode: str, theme: str = "dark", dpi: int = 150,
     return data
 
 
-def _page_count(text: str, dpi: int = 150, bars: int = 0) -> int:
+def _page_count(text: str, dpi: int = 150, bars: int = 0, rows: int = 0) -> int:
     R = mod("render")
     opt = {"dpi": dpi}
     if bars:
         opt["bars_per_row"] = int(bars)
+    if rows:
+        opt["rows_per_page"] = int(rows)
     try:
         plan = R._plan(text, opt)
         return max(1, len(plan["page_rows"]))
@@ -1251,6 +1286,10 @@ def _run_score(job):
 
     # 默认走「先弹成钢琴音频，再当音频转谱」（用户 2026-10-23 试听后点名要的）。
     # 关掉的办法：参数里 via_audio=off，或者犯错了随时改回来。
+    #
+    # 2026-10-23 试过「上传的本来就是 xml 时直读、不过音频」：同一份 PhotoScore
+    # xml 直读 211 音 / 走音频 212 音，差 1 个音等于没差，但用户明确希望所有输入
+    # 走同一条路（他怀疑差异来自流程），所以这里保持统一，不再按后缀分流。
     if _bool(opts.get("via_audio"), True):
         try:
             ev2, _bk = _sheet_to_audio_events(job, secs)
@@ -1703,6 +1742,8 @@ class App(SimpleHTTPRequestHandler):
             with open(src, "rb") as f:
                 data = f.read()
             return self._bytes(data, "image/png", "识别到的音符.png", inline=True)
+        if kind == "edit":
+            return self._edit_get(jid, q)
         if kind in ("download", "image", "export", "info"):
             job = _get_job(jid)
             text = _smc_text(jid)
@@ -1719,8 +1760,9 @@ class App(SimpleHTTPRequestHandler):
                 s = scoreio.summary(text)
                 dpi = int(_clamp(int(self._q1(q, "dpi", 150) or 150), 72, 400))
                 bars = int(_clamp(int(_int_or_none(self._q1(q, "bars")) or 0), 0, 8))
-                s.update({"pages": _page_count(text, dpi, bars), "dpi": dpi,
-                          "bars_per_row": bars,
+                rows = int(_clamp(int(_int_or_none(self._q1(q, "rows")) or 0), 0, 12))
+                s.update({"pages": _page_count(text, dpi, bars, rows), "dpi": dpi,
+                          "bars_per_row": bars, "rows_per_page": rows or 4,
                           "title_file": _safe_filename(s["title"])})
                 return self._json(s)
             if kind == "image":
@@ -1751,6 +1793,8 @@ class App(SimpleHTTPRequestHandler):
         dpi = int(_clamp(int(self._q1(q, "dpi", 150) or 150), 72, 400))
         page = int(_int_or_none(self._q1(q, "page")) or 1)
         bars = int(_clamp(int(_int_or_none(self._q1(q, "bars")) or 0), 0, 8))
+        rows = int(_clamp(int(_int_or_none(self._q1(q, "rows")) or 0), 0, 12))
+        crop = str(self._q1(q, "crop") or "") in ("1", "true", "yes", "on")
         title = _title_of(text)
         base = _safe_filename(title)
         if mode == "smc":
@@ -1794,26 +1838,26 @@ class App(SimpleHTTPRequestHandler):
                                base + f"_钢琴声（{label}）.mp3", inline=False,
                                extra={"X-Piano-Source": code})
         if mode == "info":
-            return self._json({"pages": _page_count(text, dpi, bars), "bars": bars})
+            return self._json({"pages": _page_count(text, dpi, bars, rows), "bars": bars})
         if mode == "preview":
             data = _render_to(text, "preview", theme, 110, 1, jid, title)
             return self._bytes(data, "image/png", None, inline=True)
         if mode == "pdf":
-            data = _render_to(text, "pdf", theme, dpi, 1, jid, title, bars)
+            data = _render_to(text, "pdf", theme, dpi, 1, jid, title, bars, rows)
             return self._bytes(data, "application/pdf", base + ".pdf", inline=False)
         if mode == "pages":
-            data = _render_to(text, "pages", theme, dpi, 1, jid, title, bars)
+            data = _render_to(text, "pages", theme, dpi, 1, jid, title, bars, rows)
             return self._bytes(data, "application/zip", base + "_分页.zip", inline=False)
         if mode == "page":
-            data = _render_to(text, "page", theme, dpi, page, jid, title, bars)
+            data = _render_to(text, "page", theme, dpi, page, jid, title, bars, rows, crop)
             return self._bytes(data, "image/png",
                                f"{base}_第{page}页.png", inline=True,
                                extra={"X-Page": page})
         if mode == "pagefit":
-            data = _render_to(text, "pagefit", theme, dpi, 1, jid, title, bars)
+            data = _render_to(text, "pagefit", theme, dpi, 1, jid, title, bars, rows)
             return self._bytes(data, "image/png", base + "_第一页.png",
                                inline=True, extra={"X-Page": 1})
-        data = _render_to(text, "long", theme, dpi, 1, jid, title, bars)
+        data = _render_to(text, "long", theme, dpi, 1, jid, title, bars, rows)
         return self._bytes(data, "image/png", base + "_长图.png", inline=False)
 
     # ---------- POST
@@ -1827,6 +1871,8 @@ class App(SimpleHTTPRequestHandler):
             return self._rearrange(parts[2])
         if len(parts) >= 3 and parts[1] == "cancel":
             return self._cancel(parts[2])
+        if len(parts) >= 3 and parts[1] == "edit":
+            return self._edit_save(parts[2])
         if len(parts) >= 4 and parts[1] == "history":
             jid, act = parts[2], parts[3]
             if act == "rename":
@@ -1918,10 +1964,16 @@ class App(SimpleHTTPRequestHandler):
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
+        # 手动改过的谱不能被「改调性/速度」悄悄冲掉——那份功夫是用户手一格一格点的。
+        if job.get("edited") and not payload.get("force"):
+            return self._err(409, "这首谱你手动改过，重排会把改过的格子盖回自动结果。",
+                             ["想保留改动就别重排；确实要重排，再点一次就会出现「覆盖」确认。"],
+                             hcode="edited")
         try:
             res = do_rearrange(job, payload)
         except HumanError as e:
             return self._err(400, str(e), e.advice)
+        job["edited"] = False
         return self._json({"ok": True, "job": jid, "result": res})
 
     def _cancel(self, jid):
@@ -1945,6 +1997,106 @@ class App(SimpleHTTPRequestHandler):
                     if qid in JOBS:
                         JOBS[qid]["queue_pos"] = i + 1
         return self._json({"ok": True, "status": job.get("status"), "job": _public(job)})
+
+    # ------------------------------------------------------------ 谱面编辑器
+    def _edit_get(self, jid, q):
+        """给网页编辑器用的整份谱：格子 + 那一页每个格子的像素坐标。
+
+        格子用**纯音字符**传（`1D`，不带 `>`、不用补 0），小节线由前端按 spb 画 ——
+        这样插入/删除格子之后，小节线不用跟着搬家，重新铺就行。
+        """
+        text = _smc_text(jid)
+        if text is None:
+            return self._err(404, "这个任务的谱面文件不在了。",
+                             ["重新上传一次；或者从历史里删掉这条记录。"])
+        E, R = mod("editor"), mod("render")
+        meta, slots, spb = E.from_text(text)
+        try:
+            page = int(self._q1(q, "page", 1) or 1)
+        except (TypeError, ValueError):
+            page = 1
+        dpi = int(_clamp(int(self._q1(q, "dpi", 110) or 110), 72, 200))
+        bars = int(_clamp(int(_int_or_none(self._q1(q, "bars")) or 0), 0, 8))
+        rows = int(_clamp(int(_int_or_none(self._q1(q, "rows")) or 0), 0, 12))
+        canon = E.to_text(meta, slots, spb)
+        ropt = {"dpi": dpi}
+        if bars:
+            ropt["bars_per_row"] = bars
+        if rows:
+            ropt["rows_per_page"] = rows
+        geo = R.page_geometry(canon, page=page, **ropt)
+        return self._json({
+            "ok": True, "id": jid, "page": geo.get("page"),
+            "meta": {k: meta.get(k) for k in
+                     ("title", "tempo", "time_sig", "key", "key_raw",
+                      "has8vb", "difficulty")},
+            "spb": spb, "slots": slots, "stats": E.stats(slots, spb),
+            "rows": rows or 4,
+            "geometry": geo,
+        })
+
+    def _edit_save(self, jid):
+        """保存编辑结果：格子 → SMC 文本，覆盖原文件并同步历史和结果。"""
+        raw = self._body(8 * 1024 * 1024)
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            return self._err(400, "提交的内容不是合法 JSON。")
+        slots = payload.get("slots")
+        if not isinstance(slots, list) or not slots:
+            return self._err(400, "没有收到任何格子。",
+                             ["刷新页面重新打开这首谱子再改。"])
+        text = _smc_text(jid)
+        if text is None:
+            return self._err(404, "这个任务的谱面文件不在了。",
+                             ["重新上传一次再改。"])
+        E = mod("editor")
+        meta0, _old, spb0 = E.from_text(text)
+        meta = dict(meta0)
+        for k in ("title", "tempo", "time_sig", "key", "difficulty"):
+            if payload.get("meta", {}).get(k) not in (None, ""):
+                meta[k] = payload["meta"][k]
+        if "has8vb" in (payload.get("meta") or {}):
+            meta["has8vb"] = bool(payload["meta"]["has8vb"])
+        try:
+            spb = int(payload.get("spb") or spb0 or 8)
+        except (TypeError, ValueError):
+            spb = spb0 or 8
+        spb = int(_clamp(spb, 2, 16))
+        clean = [E.full_group(E.strip_group(s)) for s in slots[:20000]]
+        new_text = E.to_text(meta, clean, spb)
+
+        path = JOBS_DIR / f"{jid}.smc"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_text, encoding="utf-8")
+
+        job = JOBS.get(jid)
+        if job is not None:
+            kind = job.get("kind") or "smc"
+            old = job.get("result") or {}
+            res = _build_result(jid, new_text, kind=kind,
+                                backend=old.get("backend") or "",
+                                params=old.get("params") or {},
+                                extra={"confidence": "手动编辑",
+                                       "grid": "手动编辑",
+                                       "hit": old.get("hit") or 100})
+            job["result"] = res
+            job["advice"] = res.get("advice") or []
+            # 手动改过：之后任何「改调性/速度」的重排都要先问一句
+            job["edited"] = True
+        # 历史列表里的标题/音数也要跟着变，否则列表和打开的对不上
+        with HIST_LOCK:
+            for it in HISTORY:
+                if it.get("id") == jid:
+                    it["title"] = meta.get("title") or it.get("title")
+                    it["notes"] = sum(1 for s in clean for c in s
+                                      if c in E.ORDER)
+                    break
+        _save_history()
+        return self._json({"ok": True, "id": jid, "spb": spb,
+                           "stats": E.stats(clean, spb),
+                           "text_len": len(new_text),
+                           "download": f"/api/download/{jid}"})
 
     def _history_rename(self, jid):
         raw = self._body(64 * 1024)

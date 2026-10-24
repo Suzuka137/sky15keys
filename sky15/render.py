@@ -10,7 +10,7 @@
   · 尾行不足 4 小节也按 4 小节排：空小节画成带小节线的空白小节，
     整行 5 条竖线齐全。
   · 行首标 `[小节号]`（行号 × 4 + 1，1 起），贴在行首小节线正上方。
-  · 头部：标题居中；左上 `调性:` / `版本:`，右上 `作者/艺术家:` / `改编:`。
+  · 头部：标题居中；左上 `调性:`，右上 `改编:`（固定 sky15）。
   · 每 4 行之间一条橙色横线分段（段间多留一点空，线才不会贴住音符）。
   · 同一格最多 3 个音，竖排、高音在上；八度点贴着数字画。
   · 深色底白字，观感和站点一致；也能切浅色。
@@ -40,7 +40,7 @@ DEFAULTS = {
     "chord_pitch": 42,      # 和弦里相邻两音的垂直距离
     "bars_per_row": 4,      # 一行 4 小节
     "slots_per_bar": 8,     # 一小节 8 列，空拍也占位
-    "rows_per_page": 8,     # 每页最多几行
+    "rows_per_page": 8,     # 每页最多几行（主界面 8 行；改谱子页面单独传 rows=4）
     "rows_per_section": 4,  # 每几行画一条橙色分段线
 }
 
@@ -99,6 +99,20 @@ def _extra_meta(text):
         "author": field("作者", "艺术家", "曲作者"),
         "arranger": field("改编", "扒谱", "制谱"),
     }
+
+
+def _pretty_title(t):
+    """文件名是上传时生成的哈希/长串时，别把它印在谱面上。
+
+    典型情况：手机上拍的截图传上来叫 `725a0c0c6da513532f15b1e81116e762.jpg`，
+    曲名就被写成了这串字符。谱面上显示「未命名」，用户可以在网页上改名。
+    """
+    s = (t or "").strip()
+    if not s:
+        return "未命名"
+    if re.fullmatch(r"[0-9a-f]{16,}", s) or re.fullmatch(r"[A-Za-z0-9_\-]{20,}", s):
+        return "未命名"
+    return s
 
 
 def _lanes(n):
@@ -229,7 +243,45 @@ def _plan(text, opt):
             "top_oct": lane_oct.get(top_lane, 0)}
 
 
+def _metrics(p):
+    """一张谱的排版量纲（和 dpi/字号/有没有八度点都有关）。
+
+    渲染和「编辑器要的坐标」必须共用这一份 —— 之前直接写在 render_pages 里，
+    复用到第二个调用方就会偷偷算歪。键：
+        pitch    相邻两条轨的间距
+        note_dy  第一条轨距行顶的偏移 → 第 i 条轨的 y = row_y_top + note_dy + i*pitch
+        glyph_h  字形墨迹高度（画选中框用）
+        bar_top/bar_bot  小节线上下端（相对行顶）
+        line_w/end_w/sep_w/dot_r  线宽和八度点半径
+    """
+    o, px = p["o"], p["px"]
+    f_note = _font(px(o["note_size"]))
+    probe = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+    gb = probe.textbbox((0, 0), "0", font=f_note)
+    asc, desc = gb[1], gb[3]              # 字形墨迹的上/下沿（相对绘制原点）
+
+    pitch = px(o["chord_pitch"])
+    note_dy = px(12)                      # 第一条轨距小节线顶端的距离
+    # 小节线固定框住 3 条轨（每一拍永远渲染 3 行，空行也占高度），
+    # 这样每一行长得一样，行与行之间上下也对得齐。
+    bar_top = note_dy + asc
+    if p["top_oct"] > 0:                  # 八度点画在音的上方，要给它们留位置
+        bar_top -= px(9) + px(3.4) + (p["top_oct"] - 1) * px(11)
+    bar_bot = note_dy + 2 * pitch + desc
+    bar_top -= px(5)
+    bar_bot += px(5)
+    return {
+        "pitch": pitch, "note_dy": note_dy, "asc": asc, "desc": desc,
+        "glyph_h": max(1, desc - asc),
+        "bar_top": bar_top, "bar_bot": bar_bot,
+        "line_w": px(2), "end_w": px(3), "sep_w": px(3),
+        "dot_r": max(2, int(round(px(o["note_size"]) * 0.085))),
+    }
+
+
 def render_pages(text, **opt):
+    footer_note = opt.pop("footer_note", "")
+    crop = bool(opt.pop("crop", False))   # True：每页按本页实际内容高度裁掉下方空白
     p = _plan(text, opt)
     o, meta, groups = p["o"], p["meta"], p["groups"]
     rows, page_rows = p["rows"], p["page_rows"]
@@ -245,36 +297,25 @@ def render_pages(text, **opt):
     f_label = _font(px(20))
     f_foot = _font(px(18))
 
-    pitch = px(o["chord_pitch"])
+    M = _metrics(p)
+    pitch, note_dy = M["pitch"], M["note_dy"]
+    bar_top, bar_bot = M["bar_top"], M["bar_bot"]
+    line_w, end_w, sep_w, dot_r = M["line_w"], M["end_w"], M["sep_w"], M["dot_r"]
 
-    # 用真实包围盒算音符上下沿，小节线才能把音（和八度点）整个框住
-    probe = ImageDraw.Draw(Image.new("RGB", (4, 4)))
-    gb = probe.textbbox((0, 0), "0", font=f_note)
-    asc, desc = gb[1], gb[3]              # 字形墨迹的上/下沿（相对绘制原点）
-
-    note_dy = px(12)                      # 第一条轨距小节线顶端的距离
-    # 小节线固定框住 3 条轨（每一拍永远渲染 3 行，空行也占高度），
-    # 这样每一行长得一样，行与行之间上下也对得齐。
-    bar_top = note_dy + asc
-    if p["top_oct"] > 0:                  # 八度点画在音的上方，要给它们留位置
-        bar_top -= px(9) + px(3.4) + (p["top_oct"] - 1) * px(11)
-    bar_bot = note_dy + 2 * pitch + desc
-    bar_top -= px(5)
-    bar_bot += px(5)
-
-    line_w = px(2)
-    end_w = px(3)
-    sep_w = px(3)
-    dot_r = max(2, int(round(px(o["note_size"]) * 0.085)))
 
     total_pages = len(page_rows)
     pages = []
     for page_no, plist in enumerate(page_rows):
-        img = Image.new("RGB", (page_w, page_h), o["paper"])
+        # 本页画布高度：默认整页；crop 时按最后一行底部裁掉空白
+        ph = page_h
+        if crop and plist:
+            _bottom = max(y for _ri, y in plist) + sys_h
+            ph = min(page_h, int(_bottom + p["foot_h"] + margin))
+        img = Image.new("RGB", (page_w, ph), o["paper"])
         d = ImageDraw.Draw(img)
 
         # ---------- 页眉：标题居中，四角两行信息 ----------
-        title = meta.get("title") or "未命名"
+        title = _pretty_title(meta.get("title"))
         if not title.startswith("《"):
             title = f"《{title}》"
         if page_no == 0:
@@ -286,14 +327,13 @@ def render_pages(text, **opt):
             d.text(((page_w - tw) / 2, px(78)), t2, font=f_meta, fill=o["dim"])
 
         key_txt = meta.get("key_raw") or meta.get("key", "C")
-        left_lines = [f"调性: {key_txt}", f"版本: {meta.get('version') or 'Orig'}"]
-        right_lines = [f"作者/艺术家: {meta.get('author') or '—'}",
-                       f"改编: {meta.get('arranger') or '—'}"]
-        for i, txt in enumerate(left_lines):
-            d.text((margin, px(118) + i * px(34)), txt, font=f_meta, fill=o["dim"])
-        for i, txt in enumerate(right_lines):
-            d.text((page_w - margin - d.textlength(txt, font=f_meta),
-                    px(118) + i * px(34)), txt, font=f_meta, fill=o["dim"])
+        # 头部只留两样：左上「调性」，右上「改编」。
+        # 「版本: Orig」「作者/艺术家: —」这两行删了 —— 我们的谱子都是同一版、
+        # 作者信息也没有，摆在那儿只是两条没内容的噪音（用户 2026-10-24 要求）。
+        d.text((margin, px(118)), f"调性: {key_txt}", font=f_meta, fill=o["dim"])
+        arr_txt = f"改编: {meta.get('arranger') or 'sky15'}"
+        d.text((page_w - margin - d.textlength(arr_txt, font=f_meta), px(118)),
+               arr_txt, font=f_meta, fill=o["dim"])
 
         # ---------- 谱面（固定网格：每行 4 小节 × 每小节 8 列） ----------
         xe = margin + p["content_w"]
@@ -348,7 +388,7 @@ def render_pages(text, **opt):
                 d.line([(margin, sy), (xe, sy)], fill=o["sep"], width=sep_w)
 
         # ---------- 页脚：左信息 / 中小字说明 / 右页码 ----------
-        fy = page_h - margin + px(4)
+        fy = ph - margin + px(4)
         diff = str(meta.get("difficulty", "") or "")
         # 页脚的小节数按**拍号**算，不按 SMC 的 8 列一格：
         # 2/4 的一小节只有 4 列，96 列是 24 小节而不是 12，
@@ -358,13 +398,13 @@ def render_pages(text, **opt):
         bars_shown = max(1, round(len(p["bars"]) * 8 / _per))
         left = (f"{meta.get('tempo', 120)} BPM · {meta.get('time_sig', '4/4')} · "
                 f"{len(groups)} 格 · {bars_shown} 小节")
-        if diff:
-            left += f" · 难度 {diff}"
         d.text((margin, fy), left, font=f_foot, fill=o["dim"])
 
-        note = "仅供个人学习研究使用，请勿商用"
-        d.text(((page_w - d.textlength(note, font=f_foot)) / 2, fy), note,
-               font=f_foot, fill=o["dim"])
+        # 页脚中间那句说明默认**不打印**（用户 2026-10-24 明确要求别在成品上带字样）。
+        # 需要时用 render_pages(..., footer_note="...") 传进来即可。
+        if footer_note:
+            d.text(((page_w - d.textlength(footer_note, font=f_foot)) / 2, fy), footer_note,
+                   font=f_foot, fill=o["dim"])
 
         pn = f"{page_no + 1} / {total_pages}"
         d.text((page_w - margin - d.textlength(pn, font=f_foot), fy), pn,
@@ -373,6 +413,98 @@ def render_pages(text, **opt):
         pages.append(img)
 
     return pages
+
+
+def page_geometry(text, page=1, **opt):
+    """一页谱面里每一格的像素坐标（给网页编辑器点选/高亮用）。
+
+    为什么要这个：渲染出来的图是死的，编辑器得知道「第 37 格在图上哪个位置」，
+    双击时才能把选中框摆到那个音上。坐标算法必须和 render_pages 完全一致，
+    所以两边都走 _plan() + _metrics()，不各写一套。
+
+    返回（像素值都以本 dpi 渲染出来的那张图为基准，前端按显示宽度等比缩放即可）：
+        page/pages/w/h/dpi/theme     基本尺寸
+        cell/margin/per_row/per_bar  网格参数
+        note_h/lane_pitch            一个数字的高度、相邻两条轨的间距
+        slots                        总格数
+        rows[]:{row, y_top, bar_top, bar_bot, slot_from, slot_to,
+                cols[]:{slot, x, w, y[3]}}   x=格子中心，y[0..2]=三条轨的文字顶部
+        pages_map[[slot_from, slot_to], ...]  每一页覆盖的格区间（翻页/定位用）
+
+    注意 cols 里包含**空格子**（没有音的拍也要能点，才能往里插音），
+    判断有没有音看 smc 的 slots 字段，不要看这里。
+    """
+    opt.pop("footer_note", None)
+    p = _plan(text, opt)
+    o = p["o"]
+    M = _metrics(p)
+    rows, page_rows = p["rows"], p["page_rows"]
+    margin, cell, measure_w = p["margin"], p["cell"], p["measure_w"]
+    per_row, per_bar = p["per_row"], p["per_bar"]
+    page_w, page_h = p["page_w"], p["page_h"]
+    n_slots = len(p["groups"])
+    pitch, note_dy = M["pitch"], M["note_dy"]
+
+    total = max(1, len(page_rows))
+    try:
+        page = int(page or 1)
+    except (TypeError, ValueError):
+        page = 1
+    page = min(max(1, page), total)
+
+    out_rows = []
+    for (ri, y_top) in page_rows[page - 1]:
+        row = rows[ri]
+        cols = []
+        for m in range(per_row):
+            bar = row[m] if m < len(row) else None
+            if not bar or "start" not in bar:
+                continue
+            bx = margin + m * measure_w
+            for k in range(per_bar):
+                slot = bar["start"] + k
+                if slot >= n_slots:
+                    break
+                cols.append({
+                    "slot": slot,
+                    "x": round(bx + (k + 0.5) * cell, 2),
+                    "w": round(cell, 2),
+                    "y": [round(y_top + note_dy + i * pitch, 2) for i in (0, 1, 2)],
+                })
+        out_rows.append({
+            "row": ri,
+            "y_top": round(y_top, 2),
+            "bar_top": round(y_top + M["bar_top"], 2),
+            "bar_bot": round(y_top + M["bar_bot"], 2),
+            "slot_from": cols[0]["slot"] if cols else 0,
+            "slot_to": cols[-1]["slot"] if cols else -1,
+            "cols": cols,
+        })
+
+    pages_map = []
+    for plist in page_rows:
+        s0, s1 = 0, -1
+        for (ri, _y) in plist:
+            row = rows[ri]
+            first = next((b for b in row if b), None)
+            last = next((b for b in reversed(row) if b), None)
+            if first and last:
+                s0 = min(s0, first["start"]) if s1 >= 0 else first["start"]
+                s1 = max(s1, last["start"] + per_bar - 1)
+        if s1 < 0:
+            pages_map.append([0, 0])
+        else:
+            pages_map.append([s0, min(s1, max(0, n_slots - 1))])
+
+    return {
+        "page": page, "pages": total, "w": page_w, "h": page_h,
+        "dpi": o["dpi"], "theme": o["theme"],
+        "cell": round(cell, 2), "margin": round(margin, 2),
+        "per_row": per_row, "per_bar": per_bar,
+        "note_h": int(M["glyph_h"]), "lane_pitch": pitch,
+        "slots": n_slots,
+        "rows": out_rows, "pages_map": pages_map,
+    }
 
 
 def render_file(smc_path, out_path, **opt):

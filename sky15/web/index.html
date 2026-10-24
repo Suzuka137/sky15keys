@@ -264,6 +264,7 @@
           <div class="card-head">
             <span class="ch-title">谱面</span>
             <div class="ch-actions">
+              <button id="btn-edit" class="btn small">改谱子</button>
               <button id="btn-score-text" class="btn small ghost">源码文本</button>
             </div>
           </div>
@@ -346,8 +347,20 @@
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
+<!-- 站内确认框：代替浏览器自带的 confirm（那个样式跟站点对不上） -->
+<div id="modal-mask" class="modal-mask" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <div class="modal-msg" id="modal-msg"></div>
+    <div class="modal-acts">
+      <button type="button" class="btn small ghost" id="modal-no">取消</button>
+      <button type="button" class="btn small" id="modal-yes">确定</button>
+    </div>
+  </div>
+</div>
+
 <script src="player.js"></script>
 <script src="pad.js"></script>
+<script src="editor.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
