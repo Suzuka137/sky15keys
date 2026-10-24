@@ -759,6 +759,10 @@ def parse_full(path, expand=True):
                             "起点（当普通音发了）")
         if len(order) != len(measures):
             warnings.append(f"part{pi+1}: 反复展开 {len(measures)} → {len(order)} 小节")
+        # 被死循环保护截断时，score_semantics 会把原因记在 LAST_WARNINGS 里 ——
+        # 以前这里是静默的，用户只看到"曲子短了一截"。
+        for _w in getattr(_sem, "LAST_WARNINGS", []) or []:
+            warnings.append(f"part{pi+1}: {_w}")
         # 参考 part：优先"不移调"的那个（钢琴/人声），全移调乐器才退回第一个
         if ref is None or (ref["transpose"] != (0, 0) and
                            data["transpose"] == (0, 0)):

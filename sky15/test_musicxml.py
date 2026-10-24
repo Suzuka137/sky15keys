@@ -331,6 +331,13 @@ FIX = HERE / "fixtures"
 REAL = pathlib.Path(__file__).parent / "out"
 
 
+class _Skip(Exception):
+    """样本缺失时抛这个：跳过，但 main() 会单独计数并写进汇总行。
+
+    以前缺样本直接 return，整套仍报「36/36 通过」—— 分母在自证。
+    """
+
+
 def _fx(name):
     return musicxml.parse_full(FIX / (name + ".musicxml"))
 
@@ -498,11 +505,13 @@ def t_real_omr_samples():
 
     雨爱：15 小节 4/4，E 大调，299 个事件，98.3% 音在调内（OMR 只错在别处）。
     Dichterliebe：2/4，A 大调，带 implicit 弱起（0.25 拍）。
+
+    缺样本时抛 `_Skip` 而不是 `return` —— 以前直接 return，整套照样报
+    「36/36 通过」，实际只跑了 35 个有内容的用例，分母在自证。
     """
     y = REAL / "omr2" / "雨爱_五线谱.mxl"
     if not y.exists():
-        print("  (跳过：没有 out/omr2/雨爱_五线谱.mxl)")
-        return
+        raise _Skip(f"没有 {y}")
     got = musicxml.parse_full(y)
     assert len(got.events) == 299, len(got.events)
     assert got.key == "E", got.key
@@ -512,12 +521,13 @@ def t_real_omr_samples():
     r = in_key_ratio(got.events, got.key)
     assert r >= 0.97, r
     d = REAL / "omr" / "Dichterliebe01-1.mxl"
-    if d.exists():
-        g2 = musicxml.parse_full(d)
-        assert len(g2.events) == 162, len(g2.events)
-        assert g2.time_sig == "2/4", g2.time_sig
-        assert abs(g2.parts[0]["measures"][0]["length"] - 0.25) < 1e-6
-        assert abs(g2.parts[0]["measures"][1]["length"] - 2.0) < 1e-6
+    if not d.exists():
+        raise _Skip(f"没有 {d}")
+    g2 = musicxml.parse_full(d)
+    assert len(g2.events) == 162, len(g2.events)
+    assert g2.time_sig == "2/4", g2.time_sig
+    assert abs(g2.parts[0]["measures"][0]["length"] - 0.25) < 1e-6
+    assert abs(g2.parts[0]["measures"][1]["length"] - 2.0) < 1e-6
 
 
 def _write_tmp(text):
@@ -571,17 +581,22 @@ _TESTS = [("基础解析", t_parse_basic), ("连音合并", t_tie_merges),
 def main():
     tests = _TESTS
     ok = 0
+    skipped = 0
     for name, fn in tests:
         try:
             fn()
             print(f"  PASS  {name}")
             ok += 1
+        except _Skip as e:
+            print(f"  SKIP  {name}  -> {e}")
+            skipped += 1
         except AssertionError as e:
             print(f"  FAIL  {name}  -> {e}")
         except Exception as e:
             print(f"  ERR   {name}  -> {type(e).__name__}: {e}")
-    print(f"\n{ok}/{len(tests)} 通过")
-    return ok == len(tests)
+    # 跳过数必须报出来：以前跳过也是「36/36 通过」，分母在自证。
+    print(f"\n{ok}/{len(tests)} 通过（跳过 {skipped}）")
+    return ok + skipped == len(tests)
 
 
 if __name__ == "__main__":

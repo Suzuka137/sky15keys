@@ -164,7 +164,10 @@ def pair_endings(measures):
     return measures
 
 
-def expand_repeats(measures):
+LAST_WARNINGS = []          # 最近一次 performance_order() 的说明，上层并进 ParsedScore.warnings
+
+
+def expand_repeats(measures, max_steps=None):
     """→ 演奏顺序（源小节下标列表，可重复）。
 
     `measures` 每项至少要能读到这四个键（缺省当没有）：
@@ -177,6 +180,7 @@ def expand_repeats(measures):
     if n == 0:
         return []
     pair_endings(measures)
+    limit = int(max_steps) if max_steps else 20 * n + 200
 
     order = []
     stack = []                 # 未闭合的 `|:` 位置
@@ -185,7 +189,11 @@ def expand_repeats(measures):
     guard = 0
     while 0 <= i < n:
         guard += 1
-        if guard > 20 * n + 200:      # 死循环保护（恶意/损坏的谱子）
+        if guard > limit:             # 死循环保护（恶意/损坏的谱子）
+            # 以前这里默默 break，用户只看到"曲子短了一截"，不知道是标记配对不上。
+            LAST_WARNINGS.append(
+                f"反复展开走到第 {guard} 步被截断（上限 {limit} 步）——"
+                f"反复/结尾标记可能配对不上，演奏顺序比实际短。")
             break
         m = measures[i]
 
@@ -219,7 +227,7 @@ def expand_repeats(measures):
     return order
 
 
-def apply_navigation(order, measures):
+def apply_navigation(order, measures, max_steps=None):
     """在反复展开结果上再套 D.C. / D.S. / Fine / To Coda。
 
     只跳一次：`visited` 之后不再响应 D.C./D.S.；Fine 也只在 `visited`
@@ -245,9 +253,13 @@ def apply_navigation(order, measures):
     visited = False           # 已经跳过 D.C./D.S. 一次
     coda_taken = False
     guard = 0
+    limit = int(max_steps) if max_steps else 4 * len(order) + 200
     while 0 <= i < len(order):
         guard += 1
-        if guard > 4 * len(order) + 200:
+        if guard > limit:
+            LAST_WARNINGS.append(
+                f"演奏顺序套 D.C./D.S. 走到第 {guard} 步被截断（上限 {limit} 步）——"
+                f"Fine/Coda/segno 位置可能有问题，结尾会比实际短。")
             break
         m = measures[order[i]]
         if m.get("fine") and visited:
@@ -271,9 +283,15 @@ def apply_navigation(order, measures):
     return out
 
 
-def performance_order(measures):
-    """反复 + 导航 的最终演奏顺序。"""
-    return apply_navigation(expand_repeats(measures), measures)
+def performance_order(measures, max_steps=None):
+    """反复 + 导航 的最终演奏顺序。
+
+    被死循环保护截断时，原因会进 `LAST_WARNINGS`（上层并进 `ParsedScore.warnings`），
+    不再静默少一段。
+    """
+    del LAST_WARNINGS[:]
+    return apply_navigation(expand_repeats(measures, max_steps=max_steps),
+                            measures, max_steps=max_steps)
 
 
 def measure_starts(order, measures):

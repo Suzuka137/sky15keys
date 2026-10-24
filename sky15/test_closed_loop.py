@@ -77,6 +77,16 @@ def main(sid="2", wav=None):
     p.write_text(out, encoding="utf-8")
     print(f"\n已写出 {p}")
 
+    # 以前这里到这就结束了：不返回、不断言、__main__ 也不 sys.exit，
+    # 于是 accept.py 里那条「闭环自测」永远 PASS —— 模型退化了也照样绿。
+    # 实测 F1 99.7（雨爱，transkun），红线定 90。
+    MIN_F1 = 90.0
+    f1 = float(res["F1"])
+    assert f1 >= MIN_F1, (
+        f"闭环 F1 只有 {f1}（红线 {MIN_F1}）—— 转谱或重排退化了。"
+        f"原音 {res['原音数']} / 新音 {res['新音数']} / 命中 {res['命中']}")
+    return 0
+
 
 if __name__ == "__main__":
-    main(*(sys.argv[1:] or ["2"]))
+    sys.exit(main(*(sys.argv[1:] or ["2"])))
