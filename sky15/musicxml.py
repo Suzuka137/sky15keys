@@ -112,8 +112,21 @@ def _load(path):
 # ---------------------------------------------------------------- 全局信息
 
 
+def _num_str(x):
+    """5.0 → "5"（拍号只认整数写法，别把 5.0 抖成 "5.0"）。"""
+    x = float(x)
+    return str(int(x)) if x == int(x) else f"{x:g}"
+
+
 def _read_time(el):
-    """<time> → ("4/4", 4.0)；长度单位是拍。复合拍号 3+2/8 会加和。"""
+    """<time> → ("4/4", 4.0)；长度单位是拍。复合拍号 3+2/8 会加和。
+
+    **加和之后必须写成合法拍号**（`3+2/8` → `5/8`）。原来把 XML 里的原文
+    `"3+2/8"` 原样外传，下游全是按 `int(n)/int(d)` 拆的：
+    `web/server.py:_bar_quarters` 的 except 会静默回落 4/4（真值 2.5 拍 →
+    一小节多算 1.5 拍，整首速度和时值全错），`smc.py` / `web/midiout.py`
+    同样吃不下。长度 `num*4/bt` 原来就是加和后的值，只有字符串没跟上。
+    """
     beats = btype = None
     for c in el:
         ct = _tag(c)
@@ -130,7 +143,7 @@ def _read_time(el):
         return None
     if bt <= 0 or num <= 0:
         return None
-    return f"{beats}/{btype}", num * 4.0 / bt
+    return f"{_num_str(num)}/{_num_str(bt)}", num * 4.0 / bt
 
 
 def _fifths_to_key(f):
@@ -267,13 +280,20 @@ def _new_measure(index, number):
 
 
 def _read_sound(el, m):
-    """<sound> 上的 tempo / 导航属性。"""
+    """<sound> 上的 tempo / 导航属性。
+
+    tempo 与 dacapo/dalsegno/tocoda/fine/segno/coda **可以同时出现**
+    （`<sound tempo="72" dacapo="yes"/>` 是 MuseScore/OMR 的常见写法）。
+    原来 tempo 一有值就 `return float(tempo)`，后面的导航标记一个都不解析 →
+    D.C./D.S./coda/fine 全丢，谱子按源顺序直排（实测 fx_dc 类谱子只出 2 小节）。
+    """
+    bpm = None
     tempo = el.get("tempo")
     if tempo:
         try:
-            return float(tempo)
+            bpm = float(tempo)
         except ValueError:
-            pass
+            bpm = None
     if (el.get("dacapo") or "").lower() in ("yes", "true", "1"):
         m["dacapo"] = True
     if el.get("dalsegno"):
@@ -286,7 +306,7 @@ def _read_sound(el, m):
         m["segno"] = True
     if el.get("coda"):
         m["coda"] = True
-    return None
+    return bpm
 
 
 def _read_words(text, m):
@@ -324,6 +344,9 @@ def _collect_part(part, default_beats=None):
     fifths, mode = 0, "major"
     first = True
     grace_dropped = 0
+    bad_divisions = 0             # <divisions> 0 / 非数字出现几次（下面会进 warnings）
+    ts_seen = []                  # [(小节号, 拍号)]：中途变拍号要留痕
+    cur_ts = None                 # 当前生效的拍号（变过之后的小节继承它）
     measures = []
     idx = 0
 
@@ -345,15 +368,30 @@ def _collect_part(part, default_beats=None):
                     ct = _tag(c)
                     if ct == "divisions":
                         try:
-                            divisions = max(1, int(float(c.text)))
+                            div = int(float(c.text))
                         except (TypeError, ValueError):
-                            pass
+                            div = None
+                        if div is None:
+                            bad_divisions += 1
+                        elif div < 1:
+                            # 和 omr._first_div 统一：clamp 到 1，并且说出来。
+                            # 0 会让 `duration / divisions` 要么炸要么整体错 4 倍
+                            bad_divisions += 1
+                            divisions = 1
+                        else:
+                            divisions = div
                     elif ct == "time":
                         got = _read_time(c)
                         if got:
                             measure_beats = got[1]
                             if time_sig is None:
                                 time_sig = got[0]
+                            # 中途变拍号：写进**本小节**（原来只记第一个，后面
+                            # 全按第一个拍号算，小节长度/速度都错）
+                            cur_ts = got[0]
+                            m["time_sig"] = got[0]
+                            if not ts_seen or ts_seen[-1][1] != got[0]:
+                                ts_seen.append((idx + 1, got[0]))
                     elif ct == "key":
                         for g in c:
                             gt = _tag(g)
@@ -524,7 +562,8 @@ def _collect_part(part, default_beats=None):
                     (m["implicit"] or (first and content_end <= length * 0.75)):
                 length = content_end
         m["length"] = length
-        m["time_sig"] = time_sig
+        # 本小节没写 <time> 就继承前面生效的那个（voice 2 之类常常只在第一行写）
+        m["time_sig"] = m["time_sig"] or cur_ts or time_sig
         m["fifths"] = fifths
         m["mode"] = mode
 
@@ -536,6 +575,7 @@ def _collect_part(part, default_beats=None):
             "fifths": fifths, "mode": mode,
             "transpose": (transpose_ch, transpose_oct),
             "grace_dropped": grace_dropped,
+            "bad_divisions": bad_divisions, "ts_seen": ts_seen,
             "saw_transpose": bool(transpose_ch or transpose_oct)}
 
 
@@ -611,6 +651,9 @@ class ParsedScore:
     # 谱子里到底写没写速度。OMR 产物一份都没有 → 全是这里兜的 100，
     # 界面上要能照实说"这个速度是兜底的"，不能让人以为是谱子写的。
     tempo_found: bool = False
+    # 一个可发声的音都没有（OMR 认不出音符时的空壳谱）。`warnings` 里也有说明，
+    # 这里给个能直接判的布尔，省得调用方去翻字符串。
+    empty: bool = False
 
     def to_seconds(self, tempo_map=None):
         """拍 → 秒。给 `tempo_map` 就用分段速度，不给就用全局单一速度。"""
@@ -699,6 +742,18 @@ def parse_full(path, expand=True):
         if data["grace_dropped"]:
             warnings.append(f"part{pi+1}: 丢掉 {data['grace_dropped']} 个装饰音"
                             "（不占时值）")
+        if data.get("bad_divisions"):
+            warnings.append(
+                f"part{pi+1}: {data['bad_divisions']} 处 <divisions> 是 0 或非数字，"
+                "已按 1 解释 —— 这种情况下的时值可能整体错几倍，"
+                "谱面本身有问题（导出它的软件/OMR 没写对单位）")
+        ts_seen = data.get("ts_seen") or []
+        if len(ts_seen) > 1:
+            warnings.append(
+                f"part{pi+1}: 中途变拍号（共 {len(ts_seen)} 个）—— "
+                + " → ".join(f"第{n}小节 {ts}" for n, ts in ts_seen[:6])
+                + ("…" if len(ts_seen) > 6 else "")
+                + "，各小节按各自拍号算长度，全局 time_sig 只代表开头")
         if dropped:
             warnings.append(f"part{pi+1}: {dropped} 个连音的 stop 找不到可接的"
                             "起点（当普通音发了）")
@@ -749,11 +804,17 @@ def parse_full(path, expand=True):
     tempo_found = bool(parts) and any(
         bool(m.get("tempos"))
         for p in parts for m in p["measures"])
+    # 一个音都没有（只解析到属性/休止）：绝不能让调用方当"识别成功"。
+    # OMR 认不出音符时最典型的产物就是这种空壳谱。
+    if not events:
+        warnings.append("这份谱里没有任何可发声的音符（只解析到属性/休止/装饰音）"
+                        "—— 别当成识别成功的结果用")
     return ParsedScore(events=events, tempo=tempo,
                        time_sig=global_ts or "4/4", key=key_name,
                        mode=mode, key_spelled=spelled, tempo_map=tmap,
                        total_beats=total_beats, parts=parts,
-                       warnings=warnings, tempo_found=tempo_found)
+                       warnings=warnings, tempo_found=tempo_found,
+                       empty=not events)
 
 
 def parse(path, expand=True):

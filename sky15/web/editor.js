@@ -162,11 +162,18 @@
     wire();
   }
 
+  var _wired = false;
+
   function wire() {
     ST.el = $('#ed');
     ST.img = $('#ed-img');
     ST.cv = $('#ed-cv');
     ST.ctx = ST.cv.getContext('2d');
+    // #ed / #ed-cv 就是页面里固定的那几个，每次打开编辑器都会再调一次 wire()。
+    // 以前 image.load 与 window.resize 在这里无脑 addEventListener，
+    // 每开关一次就多挂一份闭包 —— 改几十次谱子之后每次 resize 要重排几十遍。
+    if (_wired) return;
+    _wired = true;
 
     $('#ed-close').onclick = close;
     $('#ed-prev').onclick = function () { gotoPage(ST.page - 1); };

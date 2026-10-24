@@ -493,8 +493,16 @@ _DUO_BAD = {(1, 2), (2, 3), (3, 4), (4, 5), (6, 7),
 
 
 def _digit(char):
-    """15 键字符 → 简谱数字 1~7（忽略八度点）。"""
+    """15 键字符 → 简谱数字 1~7（忽略八度点）。
+
+    `CHARS = "DRMFSLX12345678"`：0~6 是低八度 1~7，7~13 是中八度 1~7，
+    14 是 `'8'`（= 中八度 `1` 再高八度，`OFFSET_OF['8'] == 24`）。
+    `'8'` 必须折回 **1** 而不是越界的 8 —— 否则 `_DUO_BAD` 在含 `8` 的格子上整张失效，
+    补出来的第三音可能和它凑成二度/七度。
+    """
     i = layout.CHARS.index(char)
+    if i >= 14:
+        return 1
     return (i + 1) if i < 7 else (i - 6)
 
 
@@ -661,7 +669,10 @@ def arrange(events, tempo=120, time_sig="4/4", key=None, title="",
                 root = _chords.analyze_key(events, tempo, time_sig) or root
         except Exception:
             pass
-    slot_dur = 60.0 / float(tempo_exact or tempo) / 2.0      # 一个 8 分音符
+    _t = float(tempo_exact or tempo or 100)
+    if not math.isfinite(_t) or _t <= 0:      # 脏 tempo：0 会 ZeroDivisionError，负数算出负格长
+        _t = 100.0
+    slot_dur = 60.0 / _t / 2.0      # 一个 8 分音符
 
     # ---- 音区摆放：整首太低时往上挪一个八度 -------------------------------
     # 15 键的 15 个键位是"根音 / 根音+12 / 根音+24"三层，游戏里第一行是低音行。

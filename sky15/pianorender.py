@@ -24,6 +24,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import wave
 
 import numpy as np
@@ -192,8 +193,12 @@ def events_from_smc_text(text: str) -> tuple[list[dict], str]:
     root_name = key.split("(")[0].strip() or "C"
     if root_name not in layout.KEYS:
         root_name = "C"
-    has8vb = "(8vb)" in key.lower()
+    # 注意：meta["key"] 在 smc.parse_meta 里已经被 re.sub(r"\(.*\)", "", ...) 剥掉了括号，
+    # 拿它再判 "(8vb)" 永远 False，8vb 谱会整体高八度。以 meta["has8vb"] 为准。
+    has8vb = bool(meta.get("has8vb")) or "(8vb)" in key.lower()
     tempo = float(meta.get("tempo") or 100)
+    if not math.isfinite(tempo) or tempo <= 0:      # 脏 tempo：0 会 ZeroDivisionError，负数算出负格长
+        tempo = 100.0
     slot = 60.0 / tempo / 2
     out = []
     for i, g in enumerate(groups):
@@ -225,7 +230,10 @@ def events_from(path: str | pathlib.Path) -> tuple[list[dict], str]:
 
     if ext in (".mid", ".midi"):
         got = midifile.read(str(path))
-        ev = got[0] if isinstance(got, tuple) else got
+        # midifile.read 返回的是 dict（{"events": [...], "tempo": ...}），不是 tuple/list。
+        # 写成 got[0] if isinstance(got, tuple) else got 会把整个 dict 当事件表，
+        # 于是 for e in ev 遍历的是键名字符串，e.get(...) 直接 AttributeError。
+        ev = got["events"] if isinstance(got, dict) else (got[0] if isinstance(got, tuple) else got)
         for e in ev:                          # MIDI 用 vel，统一成 velocity
             e["velocity"] = e.get("velocity") or e.get("vel") or 80
         return ev, "MIDI"
@@ -264,7 +272,7 @@ def render(events: list[dict], lib: Library, gain: float = 1.0,
     if not events:
         raise RuntimeError("谱子是空的，没有可以弹的音")
     last = max(e["start"] + e["dur"] for e in events)
-    total = int((last + TAIL_PAD) * SR)
+    total = max(int((last + TAIL_PAD) * SR), 1)      # 全部音都在 0 之前时别给 np.zeros 负长度
     buf = np.zeros((total, 2), dtype=np.float32)
 
     n_missing = 0
@@ -292,6 +300,12 @@ def render(events: list[dict], lib: Library, gain: float = 1.0,
                                                        dtype=np.float32)[:, None]
             seg[n_end + fade:] = 0.0
         i0 = int(start * SR)
+        if i0 < 0:
+            # 负 start（arrange(offset<0) / 极小 tempo / 外部 MIDI 的负时间戳）：
+            # numpy 的负下标会从缓冲区**尾部**倒着数，整个音被叠到曲尾且不报错。
+            # 正确做法是把 0 之前那一截切掉，而不是整体平移。
+            seg = seg[-i0:]
+            i0 = 0
         n = min(len(seg), total - i0)
         if n > 0:
             buf[i0:i0 + n] += seg[:n] * g
@@ -350,8 +364,8 @@ def convert(src: str | pathlib.Path, out: str | pathlib.Path | None = None,
     events, kind = events_from(src)
     if verbose:
         print(f"  来源：{kind}")
-    lib = Library()
-    buf = render(events, lib, gain=gain, normalize=normalize, verbose=verbose)
+    library = lib()          # 复用模块级 _LIB：每次 new 一个会把全部采样重新解码一遍
+    buf = render(events, library, gain=gain, normalize=normalize, verbose=verbose)
 
     if out is None:
         dst = src.with_suffix(".mp3" if want_mp3 else ".wav")
@@ -361,14 +375,12 @@ def convert(src: str | pathlib.Path, out: str | pathlib.Path | None = None,
             dst = dst / (src.stem + (".mp3" if want_mp3 else ".wav"))
 
     if want_mp3:
-        tmp = dst.with_suffix(".wav")
-        write_wav(buf, tmp)
-        to_mp3(tmp, dst)
-        if tmp != dst:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+        # 中转 wav 必须落在系统临时目录、且绝不叫 <stem>.wav：以前写在输出目录、
+        # 用同名 stem，finally 里的 unlink 会把用户自己那份 .wav 删掉（失败路径也删）。
+        with tempfile.TemporaryDirectory(prefix="sky15_mp3_") as tmpdir:
+            tmp = pathlib.Path(tmpdir) / "render.wav"
+            write_wav(buf, tmp)
+            to_mp3(tmp, dst)
     else:
         write_wav(buf, dst)
     if verbose:
@@ -388,8 +400,12 @@ def main(argv=None) -> int:
     ap.add_argument("--no-normalize", action="store_true", help="不要自动归一化")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
+    out = a.out
+    # `-o x.mp3` 也该出 MP3；以前只认 --mp3，于是把 WAV 字节写进了 .mp3 文件里。
+    want_mp3 = bool(a.mp3) or (out is not None
+                              and pathlib.Path(out).suffix.lower() == ".mp3")
     try:
-        convert(a.src, a.out, want_mp3=a.mp3, gain=a.gain,
+        convert(a.src, out, want_mp3=want_mp3, gain=a.gain,
                 normalize=not a.no_normalize, verbose=not a.quiet)
     except Exception as exc:                                   # noqa: BLE001
         print(f"出错：{exc}", file=sys.stderr)

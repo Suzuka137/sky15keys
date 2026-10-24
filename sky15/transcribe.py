@@ -71,6 +71,10 @@ def transcribe(audio_path, backend=None, device=None, **kw):
       transcribe(wav, **transcribe.OLD_PARAMS)   # 整套退回旧口径
       transcribe(wav, trim=False)      # 不裁首尾静音（录音本身已经贴 0 时用）
     """
+    # LAST_TRIM 记的是「上一次转谱裁掉了多少秒头部」。它只有 piano / transkun
+    # 两个后端会写，basic / librosa 不写 —— 于是从前者切到后者时会沿用上一首的
+    # 偏移去平移事件，整首谱错位。每一首开始前先归零。
+    LAST_TRIM["offset"] = 0.0
     if not os.path.exists(audio_path):
         raise FileNotFoundError(audio_path)
     if kw.pop("old_params", False):
@@ -281,7 +285,7 @@ def _piano(wav, device=None, onset=None, offset=None, frame=None, pedal=None,
     return _events_from_mido_midi(mid), None
 
 
-def _transkun(wav, device=None, trim=True, **_ignored):
+def _transkun(wav, device=None, trim=True, **kw):
     """Transkun 2.0（MIT，Yujia Yan）—— 公开的钢琴转录模型，实测在**真实音色**上更强。
 
     为什么默认不用它：48 首基准的音频是 `tools/render_midi` 的加法合成音，
@@ -293,6 +297,13 @@ def _transkun(wav, device=None, trim=True, **_ignored):
     它要 44.1 kHz（`pretrained/2.0.conf` 里 fs: 44100, f_max: 8000），
     所以这里单独按 44.1k 读盘，不走 16k 的那条路。
     """
+    # Transkun 没有 onset / offset / frame / pedal / segment 这套阈值（那是字节后端的
+    # 超参）。以前这里是 **_ignored 全吞：用户传 onset=0.35 也一声不吭，
+    # 会以为自己调过了，然后拿两套不可比的数去比对精度。
+    _unused = [k for k in ("onset", "offset", "frame", "pedal", "segment")
+               if kw.get(k) is not None]
+    if _unused:
+        print(f"  · Transkun 后端不吃 {', '.join(_unused)}（那是字节后端的阈值），已忽略")
     import numpy as np
     import torch
 
@@ -353,8 +364,15 @@ def _load_transkun(device="cuda"):
     conf = moduleconf.parseFromFile(cp)["Model"].config
     ck = torch.load(wp, map_location=device)
     model = ModelTransformer.TransKun(conf=conf).to(device)
-    model.load_state_dict(ck.get("best_state_dict") or ck.get("state_dict"),
-                          strict=False)
+    miss, _unexp = model.load_state_dict(
+        ck.get("best_state_dict") or ck.get("state_dict"), strict=False)
+    # strict=False 是为了容忍包里键名的少量差异。但要是整份权重都没对上，
+    # 模型会带着随机初始化照跑 —— 出谱是垃圾，却一个字都不报。
+    _total = max(1, len(model.state_dict()))
+    if miss and len(miss) > 0.3 * _total:
+        raise RuntimeError(
+            f"transkun 权重没对上（缺 {len(miss)} / {_total} 个键），"
+            f"不拿随机权重硬跑；重装 transkun，或检查 {wp}")
     model.eval()
     _TK_CACHE[key] = model
     return model

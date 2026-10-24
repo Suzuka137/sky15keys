@@ -11,6 +11,7 @@
 判定用**最常见的短音值**，不用最短音值：装饰音、倚音会给出 75 ms 这种孤点，
 拿它当依据会把本来干净的 4/4 谱也翻倍（雨爱就是这样，翻倍后反而变差）。
 """
+import math
 from collections import Counter
 
 MIN_SHARE = 0.40        # 这个音值至少要占到 40% 的相邻间隔，才算"真有这么细的音"
@@ -69,7 +70,11 @@ def choose_factor(events, tempo, max_factor=2, min_gain=0.20):
     if len(onsets) < 8:
         return 1, {"why": "音太少，不判", "loss8": 0.0, "loss16": 0.0}
 
-    slot = 60.0 / float(tempo) / 2.0
+    tempo = float(tempo or 100)
+    if not math.isfinite(tempo) or tempo <= 0:
+        # 脏 tempo（0 会 ZeroDivisionError，负数算出负格长 → _loss 全 0 → 静默不翻倍）
+        tempo = 100.0
+    slot = 60.0 / tempo / 2.0
     l1 = _loss(events, slot)
     l2 = _loss(events, slot / 2.0)
     info = {"loss8": round(l1, 3), "loss16": round(l2, 3),

@@ -19,6 +19,27 @@ import math
 
 POP_MIN, POP_MAX = 62.0, 200.0
 
+# 速度的合法区间。低于 10 已经不是音乐（0.6 BPM），高于 1000 也不是。
+_TEMPO_LO, _TEMPO_HI = 10.0, 1000.0
+
+
+def _t(tempo, default=100.0):
+    """速度兜底：非数 / 0 / 负数 → default，其余夹进 10~1000 BPM。
+
+    这个模块里 `slot = 60/tempo/2` 这种式子出现十几次，上游只要传一个 0 就是
+    ZeroDivisionError，传负数会算出**负的格长** —— 往下切窗、算索引全乱，
+    最后表现成"能跑但谱子整体错位"，比直接崩更难查。
+    速度最终来自用户输入（网页的「速度」框、谱面头部、命令行 --tempo），
+    所以统一在入口兜一次。
+    """
+    try:
+        v = float(tempo)
+    except (TypeError, ValueError):
+        return default
+    if v != v or v <= 0:            # NaN / 0 / 负
+        return default
+    return min(max(v, _TEMPO_LO), _TEMPO_HI)
+
 
 def _tatums(onsets, min_gap=0.03):
     """相邻 onset 的时间差（去掉几乎同时的音）"""
@@ -136,6 +157,9 @@ def fit_grid(onsets, tempo_hint=None, verbose=False):
     # ---- ② 倍速歧义：若有 hint 就贴它 ----
     bpm = 30.0 / slot
     if tempo_hint:
+        # 负数会让下面的 log 直接抛 math domain error（0 已被 if 挡掉）。
+        # 上游速度来自用户输入，清零写成 -1 这种事真的会发生。
+        tempo_hint = _t(tempo_hint)
         cands = [bpm * m for m in (0.5, 1.0, 2.0)]
         bpm = min(cands, key=lambda b: abs(math.log(max(b, 1e-6) / tempo_hint)))
     else:
@@ -143,7 +167,7 @@ def fit_grid(onsets, tempo_hint=None, verbose=False):
             bpm /= 2
         while bpm < 55:
             bpm *= 2
-    slot = 30.0 / bpm
+    slot = 30.0 / _t(bpm)
 
     # ---- ③ 细扫精修：两级，先在 ±4% 粗收敛，再在 ±0.3% 细收敛 ----
     # 这一步是关键。粗扫的 slot 哪怕差 2%，三分钟也能漂掉 20 格；
@@ -192,7 +216,7 @@ def fit_grid(onsets, tempo_hint=None, verbose=False):
     if verbose:
         print(f"    slot {slot:.4f}s → {bpm:.2f} BPM  R={R:.3f}  phase={ph:+.3f}  "
               f"首音 {on[0]:.3f}")
-        near = [(round(30.0 / s, 1), round(f, 2)) for s, f in fits[::40]]
+        near = [(round(30.0 / s, 1), round(f, 2)) for s, f in table[::40]]
         print(f"    扫描表(速度,音程拟合率): {near}")
     return bpm, ph, R
 
@@ -212,6 +236,7 @@ def fix_tempo_octave(onsets, tempo, min_ratio=0.72, max_double=2):
 
     只做「翻倍」不做「减半」：减半会把本来正确的曲子拖慢一倍，风险远大于收益。
     """
+    tempo = _t(tempo)
     import numpy as np
     on = np.sort(np.asarray(onsets, dtype=float))
     if on.size < 16:
@@ -224,7 +249,7 @@ def fix_tempo_octave(onsets, tempo, min_ratio=0.72, max_double=2):
 
     times = 0
     for _ in range(max_double):
-        slot = 60.0 / tempo / 2.0
+        slot = 30.0 / _t(tempo)
         if p10 < min_ratio * slot:
             tempo *= 2.0
             times += 1
@@ -245,7 +270,7 @@ def select_grid(events, tempo_hint=None, tempo_min=40, tempo_max=260):
         # 注意：以前这里只做了 snap_phase，可 `_select_grid_core` 内部会顺手
         # 搜索/纠倍速，实测 48 首里有 3 首把**正确的**提示改坏
         # （150→93.8、174→87 `_hintcheck.py`）。表现就是"我改调性，速度也跟着变"。
-        hint = float(tempo_hint)
+        hint = _t(tempo_hint)
         ph = refine_phase(onsets, hint, phase)
         return hint, snap_phase(onsets, hint, ph), {
             "reason": "按你填的速度", "head": "手填速度",
@@ -293,7 +318,7 @@ def _select_grid_core(events, tempo_hint=None, tempo_min=40, tempo_max=260):
     def score(tempo, phase):
         if tempo <= 0:
             return -1, 0
-        slot = 60.0 / tempo / 2.0
+        slot = 30.0 / _t(tempo)
         slots = set()
         for t in onsets:
             tt = t - phase
@@ -307,7 +332,7 @@ def _select_grid_core(events, tempo_hint=None, tempo_min=40, tempo_max=260):
         return filled / bars, len(slots) / max(1, bars * 8)
 
     def best_phase(tempo, around):
-        slot = 60.0 / tempo / 2.0
+        slot = 30.0 / _t(tempo)
         best = (-1, 0, around)
         for k in range(-4, 5):
             ph = around + k * slot / 4.0
@@ -357,11 +382,12 @@ def refine_phase(onsets, tempo, phase, span=0.5):
     所以超过半格的搜索没有意义。2026-10-23 试过放宽到 ±2 格，
     48 首基准 94.8 一动不动，与 snap_phase 的折叠一致。
     """
+    tempo = _t(tempo)
     import numpy as np
     on = np.asarray(onsets, dtype=float)
     if on.size == 0 or tempo <= 0:
         return phase
-    slot = 60.0 / tempo / 2.0
+    slot = 30.0 / _t(tempo)
     steps = max(20, int(40 * span))
     best_q, best_ph, best_d = -1.0, phase, 1e9
     for k in range(-steps, steps + 1):
@@ -380,12 +406,13 @@ def estimate_drift(onsets, tempo, offset=0.0, win_slots=16, max_win=80):
     任何相位都能把稀疏的点凑上，漂移根本没有可辨识度。
     结论：速度误差不能靠"事后拟合"补，只能靠用户给准速度。
     """
+    tempo = _t(tempo)
     import numpy as np
     on = np.sort(np.asarray(onsets, dtype=float))
     if on.size < 24 or tempo <= 0:
         return tempo, offset
 
-    slot = 60.0 / tempo / 2.0
+    slot = 30.0 / _t(tempo)
     ks = np.round((on - offset) / slot).astype(int)
     total = int(ks.max()) + 1
     if total < win_slots:
@@ -421,7 +448,7 @@ def estimate_drift(onsets, tempo, offset=0.0, win_slots=16, max_win=80):
     new_slot = slot + drift
     if new_slot <= 0:
         return tempo, offset
-    return 60.0 / (2.0 * new_slot), offset - float(coef[0])
+    return 30.0 / max(float(new_slot), 1e-6), offset - float(coef[0])
 
 
 def refit_grid(onsets, tempo, offset=0.0, iters=4, tol=0.40, max_drift=0.20):
@@ -432,19 +459,20 @@ def refit_grid(onsets, tempo, offset=0.0, iters=4, tol=0.40, max_drift=0.20):
     原因：挑「离格点近的音」做最小二乘，挑出来的样本本身就偏向当前网格，
     拟合必然把自己拟回原样。这是自我强化，不是估计。
     """
+    tempo = _t(tempo)
     import numpy as np
     on = np.sort(np.asarray(onsets, dtype=float))
     if on.size < 16 or tempo <= 0:
         return tempo, offset, 0.0
 
-    slot = 60.0 / tempo / 2.0
+    slot = 30.0 / _t(tempo)
     a, b = float(offset), float(slot)
 
     # 先用分窗漂移把速度拉近，再用最小二乘微调
     t2, a2 = estimate_drift(on, tempo, offset)
-    if abs(t2 - tempo) / tempo > 1e-4:
+    if abs(t2 - tempo) / _t(tempo) > 1e-4:
         tempo = t2
-        slot = 60.0 / tempo / 2.0
+        slot = 30.0 / _t(tempo)
         a, b = float(a2), float(slot)
 
     for _ in range(iters):
@@ -465,7 +493,7 @@ def refit_grid(onsets, tempo, offset=0.0, iters=4, tol=0.40, max_drift=0.20):
             break
         a, b = float(a_new), float(b_new)
 
-    tempo_out = 60.0 / (2.0 * b)
+    tempo_out = 30.0 / max(float(b), 1e-6)
     # 注意：不要「小抖动就回退到输入值」。1~2% 的偏差正是要修的量，
     # 一格 0.2 秒、整首几百格，1% 就能让后半段全错位。
     tempo_out = round(float(tempo_out), 2)
@@ -479,11 +507,12 @@ def grid_quality(onsets, tempo, offset=0.0, tol_frac=0.20):
     比圆集中度 R 好读：R 会被"音符在格上但时值抖动"拉低，
     而命中率直接回答"这速度对不对"。实测 R=0.59 的案例命中率仍有 0.93。
     """
+    tempo = _t(tempo)
     import numpy as np
     on = np.asarray(onsets, dtype=float)
     if on.size == 0:
         return 0.0
-    slot = 30.0 / tempo
+    slot = 30.0 / _t(tempo)
     q = (on - offset) / slot
     err = np.abs(q - np.round(q)) * slot
     return float((err < tol_frac * slot).sum()) / on.size
@@ -527,8 +556,9 @@ def _scale_phase(onsets, tempo, guess, span=0.5, step=0.05):
         搜太宽会返回"整格平移"的答案，音符全往后挪几格、小节线跟着错位，
         F1 从 85 直接掉到 0（实测歌 41：−1.21 格 → F1 0.0）。
     """
+    tempo = _t(tempo)
     import numpy as np
-    slot = 30.0 / tempo
+    slot = 30.0 / _t(tempo)
     best_h, best_p = -1.0, guess
     for o in np.arange(-span, span + 1e-9, step) * slot:
         ph = guess + o
@@ -541,8 +571,9 @@ def _scale_phase(onsets, tempo, guess, span=0.5, step=0.05):
 
 def _scale_stats(onsets, tempo, phase):
     """返回 (音符/小节, 填充率)"""
+    tempo = _t(tempo)
     import numpy as np
-    slot = 30.0 / tempo
+    slot = 30.0 / _t(tempo)
     y = (onsets - phase) / slot
     lo, hi = int(math.floor(y.min())), int(math.ceil(y.max()))
     total = max(1, hi - lo + 1)
@@ -559,8 +590,9 @@ def _tight_hit(onsets, tempo, tol=0.08, span=1.6, step=0.02):
     假象消失，变成真正区分"这速度对不对"的量。真值网格 0.981，×1.5 0.836、
     ×4/3 0.334、×0.75 0.633（`python sky15/_tight_hit.py`，48 首）。
     """
+    tempo = _t(tempo)
     import numpy as np
-    slot = 30.0 / tempo
+    slot = 30.0 / _t(tempo)
     best = 0.0
     for o in np.arange(-span, span + 1e-9, step) * slot:
         x = (onsets - o) / slot
@@ -575,6 +607,7 @@ def pick_tempo_scale(onsets, tempo, phase=0.0):
 
     返回 (tempo, phase, info)。info 里有候选明细，方便排查。
     """
+    tempo = _t(tempo)
     import numpy as np
     on = np.sort(np.asarray(onsets, dtype=float))
     p = TEMPO_PRIOR
@@ -611,13 +644,13 @@ def pick_tempo_scale(onsets, tempo, phase=0.0):
     for sc, tt, _ph, ht, npb, fl in rows:
         if abs(tt - t) < 0.6:
             continue
-        alts.append({"tempo": int(round(tt)), "factor": round(tt / tempo, 3),
+        alts.append({"tempo": int(round(tt)), "factor": round(tt / _t(tempo), 3),
                      "npb": round(float(npb), 2), "fill": round(float(fl), 2),
                      "hit": round(float(ht), 3), "score": round(float(sc), 3)})
         if len(alts) >= 3:
             break
     return t, ph, {"reason": "倍速纠正" if abs(t - tempo) > 0.5 else "速度未变",
-                   "factor": round(t / tempo, 3), "from": round(tempo, 1),
+                   "factor": round(t / _t(tempo), 3), "from": round(tempo, 1),
                    "score": round(s, 3), "cand": len(rows), "alts": alts}
 
 
@@ -629,7 +662,8 @@ def snap_phase(onsets, tempo, phase):
     所以按"谱从 0 秒开始"处理 —— 只保留格内的那点误差。
     不收的后果是实测的：歌 41 相位 −1.21 格 → F1 85.2 掉到 0.0，歌 7 −1.19 格 → 6.2。
     """
-    slot = 30.0 / tempo
+    tempo = _t(tempo)
+    slot = 30.0 / _t(tempo)
     return phase - round(phase / slot) * slot
 
 
@@ -952,13 +986,14 @@ def fit_warp(onsets, tempo, phase=0.0, **kw):
       max_slope 修正曲线的斜率上限；u' = u - c(u)，0.6 保证单调且留余量
       align_shift 最后整体平移 ≤半格，把窗内密度不均衡带来的系统偏买回来
     """
+    tempo = _t(tempo)
     import numpy as np
     p = dict(WARP_DEFAULTS)
     p.update({k: v for k, v in kw.items() if v is not None})
     tempo = float(tempo or 0.0)
     if tempo <= 0 or len(onsets) == 0:
         return WarpMap(info={"why": "无速度或无比"})
-    slot = 30.0 / tempo
+    slot = 30.0 / _t(tempo)
     on = _dedupe_onsets(onsets, p["gap_sec"])
     if on.size < 3 * int(p["min_onsets"]):
         return WarpMap(info={"why": f"音太少({on.size})"})
@@ -1103,12 +1138,13 @@ def warp_for(events, tempo, phase=0.0, refit=2, **kw):
     (t, 格子坐标) 折线。定点一旦收敛，输出的格子编号就和"没漂移时那套网格"一致 ——
     这正是 F1 比对的东西。
     """
+    tempo = _t(tempo)
     import numpy as np
 
     onsets = [e["start"] for e in events if e.get("dur", 1) > 0]
     if len(onsets) == 0:
         return WarpMap(info={"why": "没有 onset"})
-    slot = 60.0 / float(tempo) / 2.0
+    slot = 30.0 / _t(tempo)
     ts = np.sort(np.asarray(onsets, dtype=float))
     x = ts.copy()
     tem, ph = float(tempo), float(phase)
@@ -1127,7 +1163,7 @@ def warp_for(events, tempo, phase=0.0, refit=2, **kw):
             t2, p2, _r = select_grid(fake)
             if t2:
                 tem, ph = float(t2), float(p2)
-                slot = 60.0 / tem / 2.0
+                slot = 30.0 / _t(tem)
         except Exception:
             pass
     if n_ok == 0:
@@ -1143,7 +1179,7 @@ def warp_for(events, tempo, phase=0.0, refit=2, **kw):
     return WarpMap(list(ts), list(vals), info, slot=slot)
 
 
-def grid_from_audio(path, tempo_hint=None):
+def grid_from_audio(path, tempo_hint=None, verbose=False):
     """直接从音频估：librosa 找 onset，再拟合网格。"""
     import librosa
     y, sr = librosa.load(path, sr=22050, mono=True)
@@ -1155,7 +1191,7 @@ def grid_from_audio(path, tempo_hint=None):
         tempo, _b = librosa.beat.beat_track(onset_envelope=env, sr=sr, hop_length=512)
         tempo = float(tempo if not hasattr(tempo, "__len__") else tempo[0])
         return tempo, 0.0, 0.0
-    return fit_grid(list(times), tempo_hint=tempo_hint)
+    return fit_grid(list(times), tempo_hint=tempo_hint, verbose=verbose)
 
 
 if __name__ == "__main__":

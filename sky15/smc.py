@@ -20,11 +20,31 @@ def _field(text, name, default=""):
     return m.group(1).strip() if m else default
 
 
+def _parse_tempo(raw, default=120):
+    """速度字段 → int。容忍 `196.914`、`[]`、`120 BPM`、`~90` 这些写法。
+
+    以前是 `int(_field(...).split()[0] or 120)`：碰到浮点抛 ValueError，
+    碰到空的 `速度:[]` 抛 IndexError（`_field` 匹配到空串就返回 ""，不吃 default），
+    而这里是所有下游（editor / pianorender / render / arrange）的唯一读取入口。
+    """
+    parts = str(raw or "").split()
+    if not parts:
+        return default
+    m = re.search(r"-?\d+(?:\.\d+)?", parts[0])
+    if not m:
+        return default
+    try:
+        v = int(round(float(m.group(0))))
+    except (TypeError, ValueError):
+        return default
+    return v if 20 <= v <= 400 else default
+
+
 def parse_meta(text):
     key_raw = _field(text, "调性", "Ab") or "Ab"
     return {
         "title": _field(text, "曲名"),
-        "tempo": int(_field(text, "速度", "120").split()[0] or 120),
+        "tempo": _parse_tempo(_field(text, "速度", "120")),
         "time_sig": _field(text, "节拍", "4/4") or "4/4",
         "key_raw": key_raw,
         "key": re.sub(r"\(.*\)", "", key_raw).strip() or "Ab",

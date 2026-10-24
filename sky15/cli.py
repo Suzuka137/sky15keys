@@ -71,20 +71,56 @@ def cmd_midi(a):
     _write(text, a.output)
 
 
+_KEY_ENH = {"C#": "Db", "D#": "Eb", "E#": "F", "F#": "Gb",
+            "G#": "Ab", "A#": "Bb", "B#": "C"}
+
+
+def _norm_key(k, default="C"):
+    """谱面里的调名归一化成 layout.KEY_MIDI 认识的写法。
+
+    KEY_MIDI 只有降号那 12 个键名，所以曲子写成 `F#`/`G#`/`c` 的时候
+    cmd_smc 会直接 KeyError 崩栈 —— 而同一份文件走网页端不会崩。
+    """
+    from . import layout
+    s = str(k or "").strip()
+    for a_, b_ in (("♯", "#"), ("♭", "b"), ("＃", "#"), (" ", ""), ("调", "")):
+        s = s.replace(a_, b_)
+    if not s:
+        return default
+    s = s[0].upper() + s[1:]
+    if s in layout.KEY_MIDI:
+        return s
+    if s in _KEY_ENH:
+        return _KEY_ENH[s]
+    # `C大调` / `A minor` 这类：只认开头的音名，认不出就回默认
+    head = s[0].upper()
+    return head if head in layout.KEY_MIDI else default
+
+
 def cmd_smc(a):
-    text = open(a.input, encoding="utf-8").read()
+    try:
+        text = open(a.input, encoding="utf-8-sig").read()
+    except UnicodeDecodeError:
+        # Windows 上老谱子多半是 GBK。服务端上传路径本来就有这层兜底（utf-8-sig → gbk），
+        # CLI 这条以前直接崩栈。
+        text = open(a.input, encoding="gbk", errors="replace").read()
     meta = smc.parse_meta(text)
     groups = smc.parse_groups(text)
-    slot = 60.0 / meta["tempo"] / 2.0
+    # 格长必须按「最终要用的速度」算。以前固定用谱面里的速度换算成秒，
+    # 再交给 arrange(tempo=--tempo)：时间轴按旧速度、量化按新速度，
+    # 整首错格。现在按目标速度定格长，音符仍然落在同一格序号上。
+    use_tempo = a.tempo or meta["tempo"]
+    key = _norm_key(a.key or meta["key"])
+    slot = 60.0 / use_tempo / 2.0
     ev = []
     for i, g in enumerate(groups):
         for c in g[:3]:
             if c in "0<> ":
                 continue
             ev.append({"start": i * slot, "dur": slot,
-                       "pitch": layout.char_pitch(c, meta["key"]), "vel": 90})
-    out = arrange.arrange(ev, tempo=a.tempo or meta["tempo"], time_sig=meta["time_sig"], octave_fit=getattr(a, "octave", "auto"),
-                          key=a.key or meta["key"], title=a.title or meta["title"],
+                       "pitch": layout.char_pitch(c, key), "vel": 90})
+    out = arrange.arrange(ev, tempo=use_tempo, time_sig=meta["time_sig"], octave_fit=getattr(a, "octave", "auto"),
+                          key=key, title=a.title or meta["title"],
                           has8vb=meta["has8vb"], max_notes=a.max_notes)
     _write(out, a.output)
 
@@ -112,7 +148,7 @@ def cmd_musicxml(a):
         print(f"  变速：{got.describe_tempo()}")
     if not ev:
         print("没解析出音符 —— 确认文件是 score-partwise 格式的 MusicXML")
-        return
+        return 1
     use_tempo = a.tempo or tempo
     # 没手工指定 tempo 时按谱面的速度分段表积秒（中途变速才对得上）
     secs = musicxml.to_seconds(ev, use_tempo) if a.tempo else got.to_seconds()
@@ -167,7 +203,7 @@ def cmd_batch(a):
     files = sorted(p for p in src.rglob("*") if p.suffix.lower() in exts)
     if not files:
         print(f"{src} 里没有找到音频/视频")
-        return
+        return 1
     outdir = pathlib.Path(a.output)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -181,8 +217,10 @@ def cmd_batch(a):
             if tempo is None:
                 est, off, _why = beats.select_grid(ev, tempo_hint=a.tempo_hint)
                 tempo, offset = max(30, int(round(est))), off
-                print(f"  测速 {est:.1f} BPM（R={R:.2f}）")
-            text = arrange.arrange(ev, tempo=tempo, time_sig=a.time_sig, octave_fit=getattr(a, "octave", "auto"),
+                _hit = _why.get("base_hit") if isinstance(_why, dict) else None
+                print(f"  测速 {est:.1f} BPM"
+                      + (f"（网格契合 {_hit:.2f}）" if isinstance(_hit, (int, float)) else ""))
+            text = arrange.arrange(ev, tempo=tempo, time_sig=a.time_sig or "4/4", octave_fit=getattr(a, "octave", "auto"),
                                    key=a.key, title=f.stem, max_notes=a.max_notes,
                                    offset=offset)
             dst = outdir / (f.stem + ".smc")
@@ -194,6 +232,7 @@ def cmd_batch(a):
         except Exception as e:
             print(f"  ✗ 失败：{type(e).__name__}: {e}")
     print(f"\n完成 {done}/{len(files)}")
+    return 0 if done == len(files) else 1
 
 
 def cmd_test(a):
@@ -245,11 +284,18 @@ def cmd_doctor(a):
         ck = pathlib.Path.home() / "piano_transcription_inference_data"
         # 该目录可能有多个 .pth（如 gitcode.pth 仅 0.5 MB）；只认 >150 MB 的真权重，
         # 判据与 transcribe.auto_backend 保持一致，否则会把占位文件报成「权重 0 MB」。
-        have = sorted((ck.glob("*.pth") if ck.exists() else []),
-                      key=lambda p: p.stat().st_size, reverse=True)
-        real = [p for p in have if p.stat().st_size > 150 * 1024 * 1024]
+        def _size(p):
+            # glob 与 stat 之间文件可能被删/正在被下载，裸 stat 会 FileNotFoundError
+            # 被外层宽 except 吞掉，最后误报成「未安装」
+            try:
+                return p.stat().st_size
+            except OSError:
+                return 0
+
+        have = sorted((ck.glob("*.pth") if ck.exists() else []), key=_size, reverse=True)
+        real = [p for p in have if _size(p) > 150 * 1024 * 1024]
         if real:
-            print(f"  piano_transcription_inference  已装，权重 {real[0].stat().st_size / 1024 / 1024:.0f} MB")
+            print(f"  piano_transcription_inference  已装，权重 {_size(real[0]) / 1024 / 1024:.0f} MB")
         else:
             print("  piano_transcription_inference  已装，但权重没下（首次使用会下 165 MB）")
     except Exception:                                         # noqa: BLE001
@@ -343,7 +389,8 @@ def main(argv=None):
         sp.add_argument("--tempo", type=int, default=None)
         sp.add_argument("--tempo-hint", dest="tempo_hint", type=float, default=None,
                         help="速度提示（自动测速时消歧用）")
-        sp.add_argument("--time-sig", dest="time_sig", default="4/4")
+        sp.add_argument("--time-sig", dest="time_sig", default=None,
+                        help="拍号，如 4/4；不给就沿用谱面/MIDI 里的")
         sp.add_argument("--title", default="")
         sp.add_argument("--max-notes", dest="max_notes", type=int, default=3)
         sp.add_argument("--octave", default="auto",
@@ -411,7 +458,9 @@ def main(argv=None):
     om.set_defaults(func=cmd_omr)
 
     a = p.parse_args(argv)
-    a.func(a)
+    # 以前这里没有 return，`__main__.py` 的 sys.exit(main()) 拿到 None = 退出码恒 0，
+    # accept.py 里靠 returncode 判失败的闸门等于失效。
+    return a.func(a) or 0
 
 
 if __name__ == "__main__":

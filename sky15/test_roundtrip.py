@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
-"""回环自测：把站上真实的 81 份 SMC 还原成音符，再让重排器重新出谱，逐组比对。
+"""回环自测：把站上真实的一批 SMC 还原成音符，再让重排器重新出谱，逐组比对。
 
 这一关过了，说明"重排 + 出谱"这一段是准的 —— 换成真实音频只是把音符来源换掉。
 """
-import os
-import sys, pathlib, collections
+import sys, os, pathlib, collections
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from sky15 import layout, smc, arrange
+
+CORPUS_ENV = "SKY15_SMC_CORPUS"
+DEFAULT_CORPUS = pathlib.Path(__file__).resolve().parent.parent / "ccyuepu" / "exports" / "smc"
 
 
 def smc_to_events(text):
@@ -31,11 +33,16 @@ def main(root=None):
         return 0
     root = root or os.environ["SKY15_TRUTH"]
 
+    # 语料默认和工程同级（ccyuepu/exports/smc）。别写死本机绝对路径：
+    # 换台机器或换个盘符就找不到，而找不到时以前是静默 return 0 ——
+    # accept 那边靠 "81" 这个词就能通过，等于这道闸门从没验过。
+    root = root or os.environ.get(CORPUS_ENV) or str(DEFAULT_CORPUS)
     src = pathlib.Path(root)
     files = sorted(src.glob("*.smc"))
     if not files:
         print("没找到 smc 文件:", root)
-        return
+        print("（可用 SKY15_SMC_CORPUS 指到放了 .smc 的目录）")
+        return 2
     exact = 0
     note_match = 0
     worst = []
@@ -81,7 +88,9 @@ def main(root=None):
     print(f"  音符不一致 : {len(worst)}")
     for w in sorted(worst, key=lambda x: x[1])[:10]:
         print(f"    {w[0]:10} 一致率 {w[1]}%  原 {w[2]} 组 / 新 {w[3]} 组")
+    # 以前这里没有返回值，退出码永远是 0 —— 音符真错了也是绿的。
+    return 0 if not worst else 1
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    sys.exit(main(*sys.argv[1:]))

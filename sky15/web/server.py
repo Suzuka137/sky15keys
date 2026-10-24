@@ -79,6 +79,34 @@ JOBS_DIR = OUT / "web_jobs"
 CACHE_DIR = OUT / "web_cache"
 # 排版版本：改了 render.py 的观感（行数/字号/页眉）就 +1，让磁盘缓存失效。
 _REN_VER = "v8"
+
+# 缓存文件的尾标记：写完必然带上，没带上就是写了一半
+_TAIL = {"png": b"IEND", "zip": b"PK\x05\x06", "pdf": b"%%EOF"}
+
+
+def _cache_ok(p, ext: str) -> bool:
+    """判断缓存文件是否完整。
+
+    以前只看 size > 0：另一个线程正好在 write_bytes 写到一半时来读，就会拿到
+    半个 PNG / ZIP / PDF 直接发给浏览器。这里用文件尾魔数当完整标记，
+    写入侧配 tmp + os.replace（见 _render_bytes 末尾），读者要么看到旧文件、
+    要么看到完整文件。
+    """
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    tail = _TAIL.get(ext)
+    if not tail:
+        return True
+    try:
+        with p.open("rb") as f:
+            f.seek(max(0, size - 4096))
+            return tail in f.read()
+    except OSError:
+        return False
 HIST_FILE = OUT / "web_history.json"
 # 上传的原始文件不放 %TEMP%（那是 C 盘，几十 MB 的视频一存就好几百兆）。
 # 统一放到 out/web_uploads，跟着项目一起在 E 盘。
@@ -90,6 +118,14 @@ SHEET_EXT = {".musicxml", ".xml", ".mxl"}
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".pdf", ".webp"}
 SMC_EXT = {".smc", ".txt", ".text", ".smt"}
 SAFE_EXT = re.compile(r"^\.[a-z0-9]{1,9}$")   # `.musicxml` 是 9 个字符
+# jid 会直接拼进文件名（JOBS_DIR / f"{jid}.smc"）。必须挡住 `..`、`/`、`\`：
+# Windows 上反斜杠也是路径分隔符，`a\..\..\x.smc` 能逃出 out\web_jobs，
+# 读写删掉 jobs 目录外的任何 .smc。正常 jid 是 12 位 hex，历史里另有一个调试用的 "dbg"。
+_JID_RE = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
+
+
+def _jid_bad(jid) -> bool:
+    return not (isinstance(jid, str) and _JID_RE.match(jid))
 
 
 def _looks_like_smc(raw: bytes) -> bool:
@@ -306,6 +342,24 @@ def _ck(job):
         raise _Cancelled()
 
 
+def _jobs_gc(keep: int = 200):
+    """回收 JOBS 里已经跑完的任务。
+
+    以前 JOBS 只在删历史时才 pop 一条，而 _get_job 每次打开历史记录都会 setdefault
+    一个完整 job（带 result.smc 全文和 _cache 事件表）回内存 —— 长会话下只增不减。
+    这里只回收「已完成/出错/取消」且不在排队里的，正在跑的绝不碰。
+    """
+    with JOBS_LOCK:
+        if len(JOBS) <= keep:
+            return
+        pend = set(PENDING)
+        idle = [(j.get("created_at") or 0, jid) for jid, j in JOBS.items()
+                if jid not in pend and j.get("status") in ("done", "error", "cancelled")]
+        idle.sort()
+        for _, jid in idle[:len(JOBS) - keep]:
+            JOBS.pop(jid, None)
+
+
 def new_job(kind: str, *, name: str, source: str, params: dict) -> dict:
     jid = secrets.token_hex(6)
     stages = [{"key": k, "label": lb} for k, lb in STAGES[kind]]
@@ -326,6 +380,7 @@ def new_job(kind: str, *, name: str, source: str, params: dict) -> dict:
         for i, qid in enumerate(PENDING):
             if qid in JOBS:
                 JOBS[qid]["queue_pos"] = i + 1
+    _jobs_gc()
     return job
 
 
@@ -639,7 +694,7 @@ def _piano_audio(text: str, jid: str = "", src_events=None,
         ev = [{"pitch": int(e["pitch"]),
                "start": float(e["start"]),
                "dur": float(e.get("dur") or 0.1),
-               "velocity": int(e.get("velocity") or 80)} for e in src_events]
+               "velocity": int(e.get("velocity") or e.get("vel") or 80)} for e in src_events]
         tag, label = "src", "原谱"
     else:
         ev, _kind = PR.events_from_smc_text(text)
@@ -761,9 +816,9 @@ def _render_to(text: str, mode: str, theme: str = "dark", dpi: int = 150,
     key = str(cpath)
     with _RENDER_LOCK:
         hit = _RENDER_INDEX.get(key)
-    if hit and cpath.exists() and cpath.stat().st_size > 0:
+    if hit and _cache_ok(cpath, ext):
         return cpath.read_bytes()
-    if cpath.exists() and cpath.stat().st_size > 0:
+    if _cache_ok(cpath, ext):
         return cpath.read_bytes()
 
     R = mod("render")
@@ -810,9 +865,17 @@ def _render_to(text: str, mode: str, theme: str = "dark", dpi: int = 150,
     else:
         raise HumanError(f"不认识的导出格式：{mode}")
     try:
-        cpath.write_bytes(data)
+        # 原子落盘：先写 .part 再 os.replace，避免并发读者拿到半个文件
+        cpath.parent.mkdir(parents=True, exist_ok=True)
+        part = cpath.with_name(cpath.name + ".part")
+        part.write_bytes(data)
+        os.replace(part, cpath)
         with _RENDER_LOCK:
             _RENDER_INDEX[key] = cpath
+            _n = len(_RENDER_INDEX)
+        # 以前 _cache_gc 只在启动时跑一次，长会话里 web_cache 只增不减
+        if _n % 20 == 0:
+            _cache_gc()
     except Exception:
         pass
     return data
@@ -1489,10 +1552,10 @@ def _run_omr(job):
     job["_cache"] = {"timebase": "beats", "events": events, "tempo": tempo,
                      "time_sig": time_sig,
                      "tempo_map": list(getattr(parsed, "tempo_map", None) or [])}
-    job["params"] = dict(opts, tempo=tempo, key=key or "", backend="audiveris",
+    job["params"] = dict(opts, tempo=tempo, key=key or "", backend=_eng or "audiveris",
                          confidence="手动", hit=100, grid=grid_note)
     _stage(job, "arrange", 1.0)
-    _finish(job, text, backend="audiveris",
+    _finish(job, text, backend=_eng or "audiveris",
             extra={"confidence": "手动", "hit": 100, "grid": grid_note,
                    "doubled": 0, "source_tempo": _int_or_none(tempo_file),
                    "cover": round(cover, 3),
@@ -1670,6 +1733,13 @@ class App(SimpleHTTPRequestHandler):
             q = urllib.parse.parse_qs(u.query)
             if p.startswith("/api/"):
                 return self._get_api(p, q)
+            # 静态根就是 web\ 目录本身，server.py / midiout.py / scoreio.py 都躺在旁边。
+            # 以前 GET /server.py 能直接把源码下走（含 SAFE_EXT、_REN_VER、路径布局），
+            # 跟任何路径类问题配合都更好利用。这里只放行前端真需要的静态资源。
+            last = p.rsplit("/", 1)[-1].lower()
+            if (".." in p or p.startswith("/.") or p.endswith("/")
+                    or last.endswith((".py", ".pyc", ".bat", ".log", ".json", ".pth"))):
+                return self._err(404, "没有这个文件")
             return super().do_GET()
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -1704,7 +1774,10 @@ class App(SimpleHTTPRequestHandler):
         try:
             p = urllib.parse.urlparse(self.path).path
             if p.startswith("/api/history/"):
-                return self._history_delete(p.strip("/").split("/")[-1])
+                jid = p.strip("/").split("/")[-1]
+                if _jid_bad(jid):
+                    return self._err(404, "没有这个记录。")
+                return self._history_delete(jid)
             self._err(404, "没有这个接口")
         except Exception:
             traceback.print_exc()
@@ -1726,6 +1799,8 @@ class App(SimpleHTTPRequestHandler):
         if len(parts) < 3:
             return self._err(404, "没有这个接口")
         kind, jid = parts[1], parts[2]
+        if _jid_bad(jid):
+            return self._err(404, "没有这个任务，可能已经被清掉了。")
         if kind == "job":
             job = _get_job(jid)
             if job is None:
@@ -1863,6 +1938,8 @@ class App(SimpleHTTPRequestHandler):
     # ---------- POST
     def _post_api(self, p, q):
         parts = [x for x in p.strip("/").split("/") if x]
+        if len(parts) >= 3 and _jid_bad(parts[2]):
+            return self._err(404, "没有这个接口")
         if p == "/api/convert":
             return self._convert(q)
         if p == "/api/example":
@@ -1913,6 +1990,9 @@ class App(SimpleHTTPRequestHandler):
             "chords": (self._q1(q, "chords") or "auto").strip(),
             "harmony": _bool(self._q1(q, "harmony"), True),
             "max_notes": _clamp(_int_or_none(self._q1(q, "max_notes")) or 3, 1, 3),
+            # 界面上那个"速度起伏"选择（app.js:416 会带 ?rubato=）。以前这里没这个键，
+            # 下游 :1057 的 opts.get("rubato") 永远是 "auto"，选 on/off 都没反应。
+            "rubato": (self._q1(q, "rubato") or "auto").strip().lower(),
         }
         smc_text = None
         if kind == "smc":
@@ -1926,12 +2006,25 @@ class App(SimpleHTTPRequestHandler):
                                          "如果你拖的是五线谱图片，那要走识谱，不是这条。"])
         job = new_job(kind, name=name, source=name, params=params)
         jid = job["id"]
-        if kind == "smc":
-            job["_payload"] = {"text": smc_text}
-        else:
-            dest = WORK / f"{jid}{ext}"
-            dest.write_bytes(raw)
-            job["_payload"] = {"path": str(dest)}
+        try:
+            if kind == "smc":
+                job["_payload"] = {"text": smc_text}
+            else:
+                dest = WORK / f"{jid}{ext}"
+                dest.write_bytes(raw)
+                job["_payload"] = {"path": str(dest)}
+        except Exception as exc:
+            # 盘满 / 杀软锁住 / 没权限。new_job 已经把 jid 塞进 PENDING 了，
+            # 这里不收干净的话它永远是 queued、pending 恒 >0，后面的任务全被堵住。
+            with JOBS_LOCK:
+                if jid in PENDING:
+                    PENDING.remove(jid)
+            _set(job, status="error", stage="出错", result=None,
+                 error=f"文件没能存下来：{type(exc).__name__}: {exc}",
+                 advice=[{"level": "error",
+                          "text": "磁盘满了或文件被杀软锁住了。清点空间、换个位置再传一次。"}])
+            raise HumanError("文件没能存到工作目录，这个任务已经取消。",
+                             advice=[f"{type(exc).__name__}: {exc}"])
         _enqueue(job)
         return self._json({"job": jid, "id": jid, "kind": kind, "name": name,
                            "queue_pos": job.get("queue_pos", 1), "ok": True})
@@ -2053,9 +2146,43 @@ class App(SimpleHTTPRequestHandler):
         E = mod("editor")
         meta0, _old, spb0 = E.from_text(text)
         meta = dict(meta0)
+        pm = payload.get("meta") or {}
+
+        def _clean_meta(v):
+            """meta 会原样拼进 SMC 头部。以前前端发什么就写什么，
+            一个 difficulty = "1] 曲谱:[D R M F" 就能伪造出整行字段，
+            而 smc._field 只认第一个匹配，解析立刻错乱。"""
+            s = re.sub(r"[\[\]\r\n\t]+", " ", str(v)).strip()
+            return s[:40]
+
         for k in ("title", "tempo", "time_sig", "key", "difficulty"):
-            if payload.get("meta", {}).get(k) not in (None, ""):
-                meta[k] = payload["meta"][k]
+            v = pm.get(k)
+            if v in (None, ""):
+                continue
+            s = _clean_meta(v)
+            if not s:
+                continue
+            if k == "tempo":
+                m = re.search(r"-?\d+(?:\.\d+)?", s)
+                if not m:
+                    continue
+                n = int(round(float(m.group(0))))
+                if not (20 <= n <= 400):
+                    continue
+                s = str(n)
+            elif k == "time_sig":
+                if not re.fullmatch(r"\d{1,2}\s*/\s*\d{1,2}", s):
+                    continue
+                s = s.replace(" ", "")
+            elif k == "difficulty":
+                # 难度只该是「3 星」这种短标签。以前前端发什么写什么，
+                # `1] 曲谱:[D R M F` 能在一行里拼出看着像第二个字段的东西。
+                # 这里只认数字 + 可选「星」，其余一律丢弃。
+                m = re.search(r"\d+(?:\.\d+)?", s)
+                if not m:
+                    continue
+                s = m.group(0) + ("星" if "星" in s else "")
+            meta[k] = s
         if "has8vb" in (payload.get("meta") or {}):
             meta["has8vb"] = bool(payload["meta"]["has8vb"])
         try:
@@ -2063,7 +2190,7 @@ class App(SimpleHTTPRequestHandler):
         except (TypeError, ValueError):
             spb = spb0 or 8
         spb = int(_clamp(spb, 2, 16))
-        clean = [E.full_group(E.strip_group(s)) for s in slots[:20000]]
+        clean = [E.full_group(E.strip_group(s)) for s in slots[:20000] if isinstance(s, str)]
         new_text = E.to_text(meta, clean, spb)
 
         path = JOBS_DIR / f"{jid}.smc"
@@ -2128,7 +2255,10 @@ class App(SimpleHTTPRequestHandler):
         # 标题改了，谱面正文里的曲名也一起换掉，导出的图才一致
         text = _smc_text(jid)
         if text:
-            new_text = re.sub(r"曲名:\s*\[[^\]]*\]", "曲名:[" + title + "]", text, count=1)
+            # 用 lambda 而不是直接拼替换串：标题里若有 `\1`、`\g<0>` 之类，
+            # 会被 re 当成反向引用——轻则嵌套出名、重则抛 re.error 直接 500。
+            new_text = re.sub(r"曲名:\s*\[[^\]]*\]", lambda m: "曲名:[" + title + "]",
+                              text, count=1)
             if new_text != text:
                 (JOBS_DIR / f"{jid}.smc").write_text(new_text, encoding="utf-8")
                 if job and isinstance(job.get("result"), dict):
@@ -2143,10 +2273,12 @@ class App(SimpleHTTPRequestHandler):
         with JOBS_LOCK:
             JOBS.pop(jid, None)
         for d in (JOBS_DIR, WORK):
-            try:
-                (d / f"{jid}.smc").unlink(missing_ok=True)
-            except Exception:
-                pass
+            for pat in (f"{jid}.smc", f"{jid}.*"):
+                try:
+                    for p in d.glob(pat):
+                        p.unlink(missing_ok=True)
+                except Exception:
+                    pass
         _save_history()
         if not removed:
             return self._err(404, "历史里没有这条记录。")
@@ -2208,6 +2340,7 @@ def _get_job(jid: str):
            "_t0": time.time(), "_cancel": False, "_cache": None, "_payload": {}}
     with JOBS_LOCK:
         JOBS.setdefault(jid, job)
+    _jobs_gc()
     return JOBS.get(jid)
 
 

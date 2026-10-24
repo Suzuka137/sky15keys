@@ -655,13 +655,37 @@ def _local(tag):
 
 
 def _first_div(el, default=1):
+    """第一处 `<divisions>`，**clamp 到 ≥1**。
+
+    `<divisions>0</divisions>` 原来会一路带到下面的 lcm 再 `g / float(d)` →
+    裸 ZeroDivisionError；而 `musicxml.py` 那边早就是 `max(1, …)`（按 1 解释）。
+    两条路必须一种行为：都按 1 解释，并且由 merge 的 warn 说清楚 ——
+    否则一个炸、一个静默把时值拉伸 4 倍。
+    """
     for d in el.iter():
         if _local(d.tag) == "divisions":
             try:
-                return int(float(d.text))
+                v = int(float(d.text))
             except (TypeError, ValueError):
                 return default
+            return v if v >= 1 else 1
     return default
+
+
+def _bad_div_pages(paths, roots):
+    """哪些页的 `<divisions>` 是 0 / 非数字（要进 warnings，不能静默 clamp）。"""
+    out = []
+    for p, r in zip(paths, roots):
+        for d in r.iter():
+            if _local(d.tag) != "divisions":
+                continue
+            try:
+                if int(float(d.text)) < 1:
+                    out.append(pathlib.Path(p).name)
+            except (TypeError, ValueError):
+                out.append(pathlib.Path(p).name)
+            break
+    return out
 
 
 def _rescale_durations(root, factor):
@@ -678,6 +702,46 @@ def _rescale_durations(root, factor):
     return n
 
 
+def _write_divisions(root, value):
+    """把一份谱里所有 `<divisions>` 改写成 value；一个都没有就补一个。
+
+    **只重缩放 `<duration>` 而不改 `<divisions>` 是本模块最贵的错**：合并后
+    第 2 页仍按自己原来的单位解释已经被放大的 duration，整页内容成倍拉长。
+    实测 p001(div=4)+p002(div=8) 合并，产物里 `divisions` 是 `['4','8']`，
+    第 1 页每小节 content_end 从 4.0 变 8.0、时值 1.0/3.0 变成 2.0/6.0，
+    而 warnings 是空的。
+    """
+    import xml.etree.ElementTree as ET
+    n = 0
+    for d in root.iter():
+        if _local(d.tag) == "divisions":
+            d.text = str(int(value))
+            n += 1
+    if n:
+        return n
+    # 这一页压根没写 <divisions>（按 1 解释过）：重缩放之后必须补一个，
+    # 否则读回来还是按 1 算，时值整体放大 value 倍
+    for part in root:
+        if _local(part.tag) != "part":
+            continue
+        ns = part.tag.split("}")[0] + "}" if part.tag.startswith("{") else ""
+        for measure in part:
+            if _local(measure.tag) != "measure":
+                continue
+            attrs = [c for c in measure if _local(c.tag) == "attributes"]
+            if attrs:
+                el = ET.Element(ns + "divisions")
+                el.text = str(int(value))
+                attrs[0].insert(0, el)      # schema 要求 divisions 是 attributes 首子元素
+            else:
+                a = ET.Element(ns + "attributes")
+                ET.SubElement(a, ns + "divisions").text = str(int(value))
+                measure.insert(0, a)
+            break
+        break
+    return 1
+
+
 def _load_root(path):
     """MusicXML / .mxl → `<score-partwise>` 根元素（.mxl 是 ZIP，不能直接 parse）。"""
     import xml.etree.ElementTree as ET
@@ -685,14 +749,25 @@ def _load_root(path):
     return musicxml._load(str(path))
 
 
+# 最近一次合并的实情（divisions 原来各是多少、统一成多少、有哪些问题）。
+# 多页合并是个静默出错的重灾区，留给调用方/排查用，不影响任何返回值。
+LAST_MERGE = {"paths": [], "divisions": [], "unified": None,
+              "warnings": [], "out": None}
+
+
 def merge_musicxml(paths, out_path=None, warn=None):
     """把逐页识别出来的 MusicXML 合成一份（页序 = 传入顺序）。
 
     三件必须做的事：
-      · `<divisions>` 各页可能不同（Audiveris 按页自己算），不统一会让后一页
-        的每个时值按前一页的单位解释 → 整页错位。用 lcm 统一并重缩放 duration。
+      · `<divisions>` 各页可能不同（Audiveris / homr 按页自己算），不统一会让
+        后一页的每个时值按前一页的单位解释 → 整页错位。用 lcm 统一，**并且把
+        每页的 `<divisions>` 也改写成统一值**（只缩放 duration 不改 divisions
+        等于没修：读回来还是按旧单位算）。
       · 小节编号重排（每页都从 1 开始）。
       · 只保留第一页的 `<part-list>`；页数不同时按 part 序号对齐，缺的补空。
+
+    `warn` 收到的是给人看的中文说明（divisions 不一致 / 有页 divisions 无效 /
+    lcm 过大），同时记在 `LAST_MERGE["warnings"]` 里。
     """
     import xml.etree.ElementTree as ET
     paths = [pathlib.Path(p) for p in paths if pathlib.Path(p).exists()]
@@ -707,15 +782,30 @@ def merge_musicxml(paths, out_path=None, warn=None):
         # "not well-formed (invalid token): line 1, column 2"
         roots.append(_load_root(p))
         divs.append(_first_div(roots[-1]))
+    msgs = []
+
+    def say(msg):
+        msgs.append(msg)
+        if warn:
+            warn(msg)
+
+    bad = _bad_div_pages(paths, roots)
+    if bad:
+        say(f"这些页的 <divisions> 是 0 或非数字（{', '.join(bad)}）：按 1 解释，"
+            "时值可能整体偏大 —— 谱面本身有问题")
     g = 1
     for d in divs:
+        d = d if d >= 1 else 1
         g = int(g * d / math.gcd(g, d)) if g else d
     if g > 10 ** 6:                     # lcm 炸了（如 10080 与 480 混）：退回最大值
-        if warn:
-            warn(f"各页 divisions {divs} 的最小公倍数过大（{g}），改用最大值重缩放")
+        say(f"各页 divisions {divs} 的最小公倍数过大（{g}），改用最大值重缩放")
         g = max(divs)
+    if len(set(divs)) > 1:
+        say(f"各页 divisions 不一致 {divs} → 统一成 {g}（duration 已按比例重缩放）")
     for r, d in zip(roots, divs):
+        d = d if d >= 1 else 1
         _rescale_durations(r, g / float(d))
+        _write_divisions(r, g)          # ← 光缩放 duration 不改 divisions 就是错谱
 
     ns = ""
     tag = roots[0].tag
@@ -761,6 +851,8 @@ def merge_musicxml(paths, out_path=None, warn=None):
         tmpdir("sky15_merge") / "merged.musicxml"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(str(out_path), encoding="utf-8", xml_declaration=True)
+    LAST_MERGE.update(paths=[str(p) for p in paths], divisions=list(divs),
+                      unified=int(g), warnings=list(msgs), out=str(out_path))
     return out_path
 
 
@@ -956,33 +1048,44 @@ def homr_available() -> bool:
 
 
 def _homr_run_root() -> pathlib.Path:
-    """homr 的运行目录。
+    """homr 的运行目录 —— 交给 `tmp.py` 统一管。
 
-    必须在工作区里、不能用系统 %TEMP%：rapidocr 会把 OCR 用的中间图
+    **必须在工作区里、不能用系统 %TEMP%**：rapidocr 会把 OCR 用的中间图
     `page_tesseract_input.png` 写在自己的 cwd 下再去读，在 Windows 的
     %TEMP% 里这一步会失败（实测三种 cwd 全报 LoadImageError，同一张图
-    放到工作区就正常）。所以统一落在 `sky15/out/.homr_run/`。
+    放到工作区就正常）。
+
+    原来硬编码 `sky15/out/.homr_run/`，绕开了 `tmp.py` 的清理规则：目录
+    只增不删、也不在 `out/tmp/` 里，看 `out` 目录时像个野目录。现在走
+    `tmpdir()`（→ `sky15/out/tmp/sky15_homr_run_xxxx/`，三天前的自动清）。
     """
-    root = pathlib.Path(__file__).resolve().parent / "out" / ".homr_run"
     try:
-        root.mkdir(parents=True, exist_ok=True)
-    except OSError:
+        return tmpdir("sky15_homr_run")
+    except OSError:                    # 工作区不可写（只读盘/权限）：退回系统 temp
         root = pathlib.Path(tempfile.gettempdir()) / "sky15_homr_run"
         root.mkdir(parents=True, exist_ok=True)
-    return root
+        return root
 
 
 # homr --debug 会把「它认出来的音符」画回原图（绿/蓝框）。最近一次的结果记在这，
 # 给前端做「看它到底认到了哪」用：漏音的地方一眼就能看见，比只看输出谱强。
 LAST_DEBUG = {"notes": None, "all": []}
 
+# 最近一次 homr 跑了几个 PDF 页、有哪些话要说（多页/合并/丢页都记在这）
+LAST_HOMR = {"pages": None, "warnings": [], "out": None}
+
 
 def to_musicxml_homr(image_path, outdir=None, timeout=420, on_step=None,
-                     keep_debug=False):
+                     keep_debug=False, warn=None):
     """图片 → MusicXML（用 homr）。
 
     homr 只会把 xml 写在图片旁边，所以先把图复制成纯 ascii 名字（它用
     cv2.imread 读图，中文路径会失败），跑完再搬回来。
+
+    PDF 多页：**每一页都跑**，跑完 `merge_musicxml` 合成一份（原来
+    `last=1` 只认第 1 页，第 2 页起静默丢失 —— 而 `to_musicxml_best`
+    默认就是 homr，等于多页 PDF 一律只剩第一页）。页数、合并提示都进
+    `warn` / `LAST_HOMR["warnings"]`。
 
     keep_debug=True 时额外要一张「识别结果叠在原图上」的图（--debug 产出的
     `*_notes.png`），路径写进 `LAST_DEBUG["notes"]`，并且拷到 outdir 里。
@@ -1001,106 +1104,221 @@ def to_musicxml_homr(image_path, outdir=None, timeout=420, on_step=None,
     outdir = pathlib.Path(outdir or tmpdir("sky15_homr"))
     outdir.mkdir(parents=True, exist_ok=True)
     step = on_step or (lambda *a, **k: None)
+    msgs = []
+    LAST_HOMR.update(pages=None, warnings=[], out=None)
+
+    def say(msg):
+        msgs.append(msg)
+        if warn:
+            warn(msg)
+
     td = _homr_run_root() / f"r{int(time.time() * 1000) % 10 ** 9}"
     td.mkdir(parents=True, exist_ok=True)
     try:
-        work = td / "page.png"
+        # --- 分页：PDF 每一页都要认，不许只认第 1 页 ---
+        # 原来这里是 `pdf_to_images(..., last=1)` + 只跑一次 homr：多页 PDF
+        # 第 2 页起**静默消失**（`to_musicxml_best` 默认 engines=("homr",)，
+        # 等于整个识谱链路默认丢掉后面的页）。现在逐页跑，跑完合并。
         if src.suffix.lower() in PDF_EXT:
-            imgs = pdf_to_images(src, td, dpi=400, last=1)
-            shutil.copyfile(imgs[0], work)
-        elif src.suffix.lower() != ".png":
-            from PIL import Image
-            Image.open(src).convert("RGB").save(work)
+            imgs = pdf_to_images(src, td / "pdf", dpi=400)
         else:
-            shutil.copyfile(src, work)
-        step("homr 识别中", {})
-        t0 = time.time()
+            imgs = [src]
+        pages = max(1, len(imgs))
+        if pages > 1:
+            say(f"这份 PDF 有 {pages} 页：逐页识别后合并成一份"
+                f"（每页超时上限 {timeout}s）")
+            step(f"PDF {pages} 页 → 逐页 homr", {"pages": pages})
+
         # homr 自带的 --debug 会把每个音标成 `note12` 压在谱面上，密到看不清。
         # 走 tools/homr_overlay.py（同一个 venv 的 python 跑）：它先把画法换成
         # 「只画音符头的小圈」，再调 homr，出的叠图干净、能直接给用户看。
         overlay_py = pathlib.Path(__file__).resolve().parent / "tools" / "homr_overlay.py"
         venv_py = pathlib.Path(str(exe)).parent / "python.exe"
         use_overlay = keep_debug and overlay_py.exists() and venv_py.exists()
-        if use_overlay:
-            cmd = [str(venv_py), str(overlay_py), str(work)]
-        else:
-            cmd = [str(exe), str(work)] + (["--debug"] if keep_debug else [])
-        proc = subprocess.run(cmd, capture_output=True,
-                              text=True, timeout=timeout, cwd=str(td),
-                              encoding="utf-8", errors="replace")
-        dt = time.time() - t0
         LAST_DEBUG["notes"] = None
         LAST_DEBUG["all"] = []
-        if keep_debug:
-            # `write_all_bounding_boxes_alternating_colors("notes", ...)` 落成
-            # `page_debug_<n>_notes.png`，是全部认出来的音符（含符干位置）。
-            found = sorted(td.glob("*notes*.png"))
-            LAST_DEBUG["all"] = [str(p) for p in sorted(td.glob("*_debug_*.png"))]
-            if found:
-                dst_dbg = outdir / (src.stem + "_homr_notes.png")
-                try:
-                    shutil.copyfile(found[-1], dst_dbg)
-                    LAST_DEBUG["notes"] = str(dst_dbg)
-                except OSError:
-                    pass
-        made = sorted(td.glob("*.musicxml"))
+
+        made, secs = [], 0.0
+        for i, img in enumerate(imgs, 1):
+            sub = td / f"p{i:03d}"
+            sub.mkdir(parents=True, exist_ok=True)
+            work = sub / "page.png"
+            if src.suffix.lower() in PDF_EXT:
+                shutil.copyfile(img, work)
+            elif src.suffix.lower() != ".png":
+                from PIL import Image
+                Image.open(src).convert("RGB").save(work)
+            else:
+                shutil.copyfile(src, work)
+            where = "homr 识别中" if pages == 1 else f"homr 识别中（第 {i}/{pages} 页）"
+            step(where, {"page": i, "pages": pages})
+            t0 = time.time()
+            if use_overlay:
+                cmd = [str(venv_py), str(overlay_py), str(work)]
+            else:
+                cmd = [str(exe), str(work)] + (["--debug"] if keep_debug else [])
+            proc = subprocess.run(cmd, capture_output=True,
+                                  text=True, timeout=timeout, cwd=str(sub),
+                                  encoding="utf-8", errors="replace")
+            dt = time.time() - t0
+            secs += dt
+            if keep_debug:
+                # `write_all_bounding_boxes_alternating_colors("notes", ...)` 落成
+                # `page_debug_<n>_notes.png`，是全部认出来的音符（含符干位置）。
+                found = sorted(sub.glob("*notes*.png"))
+                if found:
+                    suffix = "_homr_notes.png" if i == 1 else f"_homr_notes_p{i}.png"
+                    dst_dbg = outdir / (src.stem + suffix)
+                    try:
+                        shutil.copyfile(found[-1], dst_dbg)
+                        if i == 1:
+                            LAST_DEBUG["notes"] = str(dst_dbg)
+                    except OSError:
+                        pass
+                LAST_DEBUG["all"] += [str(p) for p in sorted(sub.glob("*_debug_*.png"))]
+            got = sorted(sub.glob("*.musicxml"))
+            if not got:
+                raise RuntimeError(
+                    f"第 {i}/{pages} 页 homr 跑完了但没出 MusicXML"
+                    f"（返回码 {proc.returncode}，{dt:.1f}s）\n"
+                    f"{(proc.stderr or proc.stdout or '')[-700:].strip()}")
+            made.append(got[0])
+            if pages > 1:
+                step(f"第 {i}/{pages} 页完成（{dt:.1f}s）", {"sec": round(dt, 1)})
         if not made:
-            raise RuntimeError(
-                f"homr 跑完了但没出 MusicXML（返回码 {proc.returncode}，{dt:.1f}s）\n"
-                f"{(proc.stderr or proc.stdout or '')[-700:].strip()}")
+            raise RuntimeError("homr 没有产出任何 MusicXML")
+
         dst = outdir / (src.stem + "_homr.musicxml")
-        shutil.copyfile(made[0], dst)
-        step(f"homr 完成（{dt:.1f}s）", {"sec": round(dt, 1)})
+        if len(made) == 1:
+            shutil.copyfile(made[0], dst)
+        else:
+            for i, one in enumerate(made, 1):
+                shutil.copyfile(one, outdir / f"{src.stem}_homr_p{i}.musicxml")
+            dst = pathlib.Path(merge_musicxml(made, dst, warn=warn))
+            step(f"{len(made)} 页已合并", {"mxl": str(dst), "pages": len(made)})
+        LAST_HOMR.update(pages=pages, warnings=list(msgs), out=str(dst))
+        step(f"homr 完成（{secs:.1f}s）", {"sec": round(secs, 1), "pages": pages})
         return dst
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
 
-def _cover_of_events(ev) -> float:
-    """有音时间占比（10ms 网格）。识谱好不好的第一判据。"""
+def _cover_of_events(ev, span=None) -> float:
+    """有音时间占比（10ms 网格）。识谱好不好的第一判据。
+
+    分母取 **`span`（谱面总时长）** 和"最后一个音的结束"里大的那个。
+    原来只用后者：一段只有 3 个音、铺在第一小节的碎谱也能拿 cover≈1.0
+    （审计 A 实测 16 小节的谱只认出 3 个音，cover 0.989、总分 0.995，
+    赢过真正读全的那份）。
+    """
     if not ev:
         return 0.0
     last = max(float(e["start"]) + float(e.get("dur") or 0) for e in ev)
-    if last <= 0:
+    total = max(last, float(span or 0.0))
+    if total <= 0:
         return 0.0
-    n = int(last / 0.01) + 2
+    n = int(total / 0.01) + 2
     grid = bytearray(n)
     for e in ev:
         a = max(0, int(float(e["start"]) / 0.01))
         b = min(n, int((float(e["start"]) + float(e.get("dur") or 0)) / 0.01))
         for i in range(a, b):
             grid[i] = 1
-    return sum(grid) / n
+    return sum(grid) / float(n)
+
+
+def _bar_fill(measures) -> float:
+    """小节填充率：每小节"内容终点"离小节线有多远（1.0 = 都正好落在线上）。
+
+    OMR 最常见的两种错法都在这里露头：漏音（内容短一截）和串行
+    （内容冲过小节线）。只看覆盖率看不出这两种。
+    """
+    dev, n = 0.0, 0
+    for m in measures or []:
+        length = float(m.get("length") or 0.0)
+        if length <= 0:
+            continue
+        end = max((float(it["onset"]) + float(it["dur"]) for it in m["items"]),
+                  default=0.0)
+        if end <= 0:
+            continue
+        dev += min(1.0, abs(end - length) / length)
+        n += 1
+    return 1.0 - dev / n if n else 0.0
+
+
+def _rate_ok(rate) -> float:
+    """起音速率的合理性（1.0 = 正常）。1.5~8 起音/秒是正常钢琴谱：
+    低于 1.5 基本是"被拉伸"（小节线读错，整首拉长），高于 8 是虚音/重影。
+    """
+    if rate <= 0:
+        return 0.0
+    if rate < 1.5:
+        return rate / 1.5
+    if rate <= 8.0:
+        return 1.0
+    return 8.0 / rate
 
 
 def score_musicxml(path) -> dict:
     """给一份 MusicXML 打分，用来在同一张图的多次识别里挑最好的一份。
 
-    三个判据（都有实测依据）：
-      cover      有音时间占比。覆盖率一塌，听感就是「断断续续」。
-      onset_rate 每秒起音点。把小节线读错会把整首拉长（实测同一张图
-                 4/4 读出 67.8s、2/4 读出 28.5s，同一页音乐），拉长后
-                 起音速率明显变低，这是最便宜的「被拉伸」探针。
-      notes      音数，只做极小的 tie-break。
+    四个判据（都有实测依据），加权几何平均到 0~1：
+      cover      有音时间占比（分母 = 谱面总时长）。覆盖率一塌，听感就是断断续续。
+      bar        小节填充率。漏音/串行都会让它掉。
+      dens       音密度（每拍几个音，≥0.5 算正常）。
+      rate_ok    起音速率是否在 1.5~8/s。把小节线读错会把整首拉长（实测同一张
+                 图 4/4 读出 67.8s、2/4 读出 28.5s），拉长后起音速率明显偏低。
+
+    **为什么不用"覆盖率 + 一点加分"：** 那样一来"每小节一个全音符"的错谱
+    覆盖率反而更高（0.9933 赢过对谱 0.9740），因为它把所有时间都占满了。
+    改成乘积以后，覆盖率再高，起音速率/密度不合理就整体打折。
     """
-    from . import musicxml
+    from . import musicxml, score_semantics as _sem
     got = musicxml.parse_full(str(path))
     ev = got.to_seconds()
-    cov = _cover_of_events(ev)
+    total_beats = float(got.total_beats or 0.0)
+    span = (_sem.seconds_at(total_beats, _sem.normalize_tempo_map(got.tempo_map))
+            if total_beats > 0 else 0.0)
+    cov = _cover_of_events(ev, span)
     last = max((float(e["start"]) + float(e.get("dur") or 0) for e in ev),
                default=0.0)
     ons = len({round(float(e["start"]), 3) for e in ev})
     rate = ons / last if last > 0 else 0.0
-    score = cov + min(rate, 8.0) / 8.0 * 0.03 + min(len(ev), 4000) / 4000 * 0.02
+    bar = _bar_fill(got.parts[0]["measures"] if got.parts else [])
+    dens = min(1.0, len(ev) / max(total_beats, 1e-6) / 0.5)
+    rok = _rate_ok(rate)
+    score = (cov ** 0.5) * (bar ** 0.15) * (dens ** 0.15) * (rok ** 0.2)
     return {"notes": len(ev), "cover": round(cov, 4),
             "onset_rate": round(rate, 2), "dur": round(last, 1),
+            "bar_fill": round(bar, 4), "density": round(dens, 4),
+            "rate_ok": round(rok, 3), "total_beats": round(total_beats, 2),
+            "empty": bool(getattr(got, "empty", not ev)),
             "time_sig": got.time_sig, "key": got.key, "tempo": got.tempo,
             "score": round(score, 5)}
 
 
+def _too_weak(info, min_notes=20, min_cover=0.5):
+    """识别结果太寒酸时给一句中文说明（None = 过闸）。
+
+    只有覆盖率没有绝对下限 = "3 个音、覆盖 5%" 也算成功（审计 A 实测）。
+    `min_notes` / `min_cover` 传 0 可以关掉对应那一条。自定义 scorer 返回的
+    dict 里没有 notes/cover 时跳过那一条，不动老调用方。
+    """
+    bad = []
+    if min_notes and "notes" in info and int(info.get("notes") or 0) < min_notes:
+        bad.append(f"只认出 {int(info.get('notes') or 0)} 个音（下限 {min_notes}）")
+    if min_cover and "cover" in info and float(info.get("cover") or 0.0) < min_cover:
+        bad.append(f"有音时间只占 {100 * float(info.get('cover') or 0.0):.1f}%"
+                   f"（下限 {100 * min_cover:.0f}%）")
+    if not bad:
+        return None
+    return "识别结果太不完整：" + "，".join(bad)
+
+
 def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
                      scorer=None, on_step=None, engines=("homr",),
-                     keep_debug=False, **kw):
+                     keep_debug=False, min_notes=20, min_cover=0.5, **kw):
     """图片 → MusicXML，多个引擎/多个放大倍数都跑一遍，取最好的那份。
 
     默认只用 homr（2026-10-23 用户定的：只留 homr，Audiveris 从识别流程里撤掉）。
@@ -1114,6 +1332,10 @@ def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
       engines  要试的引擎，默认 ("homr",)——没装就报错，不悄悄降级
       scales   Audiveris 的放大倍数（默认引擎下用不到）
       scorer   回调 (mxl_path) -> dict，含 `score` 键，越大越好
+      min_notes / min_cover
+               绝对下限（默认 20 音 / 覆盖率 50%）。低于就算这次识别失败，
+               抛 RuntimeError 说清差在哪。传 0 关掉对应那一条——审计 A 实测
+               "3 个音、覆盖 5%" 原来会被当成成功交给用户。
     返回
       (最好的 mxl 路径, 明细 dict)
     """
@@ -1163,14 +1385,23 @@ def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
         _try("homr", "homr",
              lambda: to_musicxml_homr(src, outdir / "s_homr", on_step=step,
                                       keep_debug=keep_debug))
+        # 多页 PDF 的页数/合并提示挂在候选上（best 和 tries 里是同一个 dict，
+        # 改一处两边都看得到）。审计 A 致命 4：只识第 1 页、静默丢页。
+        for t in tries:
+            if t.get("engine") == "homr" and "error" not in t:
+                t["pages"] = LAST_HOMR.get("pages")
+                if LAST_HOMR["warnings"]:
+                    t["warnings"] = list(LAST_HOMR["warnings"])
         if best is not None and best.get("engine") == "homr" and LAST_DEBUG["notes"]:
             best["debug_notes"] = LAST_DEBUG["notes"]
 
     # homr 读得很干净就直接交卷，不再花 30~40 秒把 Audiveris 跑四遍。
-    # 判据：覆盖率 ≥99.5% 且起音速率在 1.5~8/s（速率过低是被拉伸，过高是虚音）。
+    # 判据：覆盖率 ≥99.5% 且起音速率在 1.5~8/s（速率过低是被拉伸，过高是虚音），
+    # 且过了绝对下限（不然"3 个音、覆盖 5%"这种残谱也会被当成够干净）。
     early = (best is not None and best.get("engine") == "homr"
              and best.get("cover", 0) >= 0.995
-             and 1.5 <= best.get("onset_rate", 0) <= 8.0)
+             and 1.5 <= best.get("onset_rate", 0) <= 8.0
+             and _too_weak(best, min_notes, min_cover) is None)
     if early:
         step("homr 读得够干净，跳过其他引擎", {})
     elif "audiveris" in engines:
@@ -1183,6 +1414,20 @@ def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
     if best is None:
         raise RuntimeError("所有识别都失败了：\n" + "\n".join(
             f"  · {t.get('tag')}: {t.get('error', '')[:200]}" for t in tries))
+    # 绝对下限：光看覆盖率，"每小节一个全音符"的错谱反而能赢（审计 A 实测
+    # 0.9933 > 0.9740），"3 个音、覆盖 5%"也算成功。这里兜住下限，宁可按
+    # 失败报出来，也不给用户一份"看着成功、其实是残谱"的结果。
+    weak = _too_weak(best, min_notes, min_cover)
+    if weak:
+        # 注意别让这条信息被上下文吃掉：web 那边只把「最后一行」甩给用户，
+        # 所以结论句放最后，原因/下一步放前面。
+        raise RuntimeError(
+            f"识谱结果太不完整（引擎：{best.get('engine')}）。\n"
+            "  可能原因：图太小/太糊、不是五线谱、裁掉了谱面。\n"
+            "  下一步：preprocess_image 把 interline 放大到 15~20px 再跑；"
+            "确认是整页谱而不是局部截图。\n"
+            "  确认这就是一份短谱的话，显式放宽：min_notes=0, min_cover=0。\n"
+            + weak)
     best["tries"] = [{k: v for k, v in t.items() if k != "mxl"} for t in tries]
     step(f"选用 {best['engine']}（覆盖 {100 * best['cover']:.1f}%，"
          f"{best['notes']} 音）", best)
