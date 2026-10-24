@@ -10,7 +10,7 @@
   · 尾行不足 4 小节也按 4 小节排：空小节画成带小节线的空白小节，
     整行 5 条竖线齐全。
   · 行首标 `[小节号]`（行号 × 4 + 1，1 起），贴在行首小节线正上方。
-  · 头部：标题居中；左上 `调性:` / `版本:`，右上 `作者/艺术家:` / `改编:`。
+  · 头部：标题居中；左上 `调性:`，右上 `改编:`（固定 sky15）。
   · 每 4 行之间一条橙色横线分段（段间多留一点空，线才不会贴住音符）。
   · 同一格最多 3 个音，竖排、高音在上；八度点贴着数字画。
   · 深色底白字，观感和站点一致；也能切浅色。
@@ -301,14 +301,13 @@ def render_pages(text, **opt):
             d.text(((page_w - tw) / 2, px(78)), t2, font=f_meta, fill=o["dim"])
 
         key_txt = meta.get("key_raw") or meta.get("key", "C")
-        left_lines = [f"调性: {key_txt}", f"版本: {meta.get('version') or 'Orig'}"]
-        right_lines = [f"作者/艺术家: {meta.get('author') or '—'}",
-                       f"改编: {meta.get('arranger') or '—'}"]
-        for i, txt in enumerate(left_lines):
-            d.text((margin, px(118) + i * px(34)), txt, font=f_meta, fill=o["dim"])
-        for i, txt in enumerate(right_lines):
-            d.text((page_w - margin - d.textlength(txt, font=f_meta),
-                    px(118) + i * px(34)), txt, font=f_meta, fill=o["dim"])
+        # 头部只留两样：左上「调性」，右上「改编」。
+        # 「版本: Orig」「作者/艺术家: —」这两行删了 —— 我们的谱子都是同一版、
+        # 作者信息也没有，摆在那儿只是两条没内容的噪音（用户 2026-10-24 要求）。
+        d.text((margin, px(118)), f"调性: {key_txt}", font=f_meta, fill=o["dim"])
+        arr_txt = f"改编: {meta.get('arranger') or 'sky15'}"
+        d.text((page_w - margin - d.textlength(arr_txt, font=f_meta), px(118)),
+               arr_txt, font=f_meta, fill=o["dim"])
 
         # ---------- 谱面（固定网格：每行 4 小节 × 每小节 8 列） ----------
         xe = margin + p["content_w"]
