@@ -957,26 +957,19 @@ def do_rearrange(job, p: dict) -> dict:
                              advice=["把原文件重新拖进来转一次，再改参数。"])
         if tempo_arg:
             tempo, phase, why = B.select_grid(events, tempo_hint=tempo_arg)
-            try:
-                hit = float(B.grid_quality([e["start"] for e in events], tempo, phase))
-            except Exception:
-                hit = 1.0
-            conf = "手动"
+            hit = _grid_hit(B, events, tempo, phase)
+            conf = "手动" if hit is not None else "手动·速度待核"
             grid = why.get("head") or why.get("reason") or ""
             doubled = int(why.get("doubled") or 0)
         else:
             auto = cache.get("auto")
             if not auto:
                 tempo, phase, why = B.select_grid(events)
-                try:
-                    h = float(why.get("base_hit")
-                              or B.grid_quality([e["start"] for e in events], tempo, phase))
-                except Exception:
-                    h = 1.0
+                h = _grid_hit(B, events, tempo, phase, why.get("base_hit"))
                 auto = {"tempo": int(tempo), "phase": float(phase), "hit": h,
                         "grid": why.get("head") or why.get("reason") or "",
                         "doubled": int(why.get("doubled") or 0),
-                        "conf": "高" if h >= 0.85 else "中" if h >= 0.70 else "低"}
+                        "conf": _conf_of(h)}
                 cache["auto"] = auto
             tempo, phase = auto["tempo"], auto["phase"]
             hit, conf = auto["hit"], auto["conf"]
@@ -991,7 +984,8 @@ def do_rearrange(job, p: dict) -> dict:
               "backend": prev.get("backend") or ""}
     res = _build_result(job["id"], text, kind=kind,
                         backend=prev.get("backend") or "", params=params,
-                        extra={"confidence": conf, "hit": int(round(hit * 100)),
+                        extra={"confidence": conf,
+                               "hit": (None if hit is None else int(round(hit * 100))),
                                "grid": grid, "doubled": doubled, "rearranged": True,
                                "auto_tempo": (cache.get("auto") or {}).get("tempo")})
     path = JOBS_DIR / f"{job['id']}.smc"
@@ -1010,6 +1004,30 @@ def do_rearrange(job, p: dict) -> dict:
 
 
 # ---------------------------------------------------------------- 三种 worker
+def _grid_hit(B, events, tempo, phase, cached=None):
+    """算网格命中率（0~1）。算不出来返回 None（=未知），绝不返回 1.0。
+
+    以前这里是 `except Exception: hit = 1.0` —— 方向反了：算不出来本该是
+    "不知道"，却变成"命中率 100%、置信度高"，用户看到的就是一句「置信度：高」。
+    另一个坑是 `why.get("base_hit") or ...`：base_hit 恰好是 0.0 时被 `or` 当假，
+    白算一遍，还可能把确定的 0 换成别的值。所以这里用 isinstance 判断，
+    0.0 照样采纳；真是 None 才回退去算。
+    """
+    if isinstance(cached, (int, float)):
+        return float(cached)
+    try:
+        return float(B.grid_quality([e["start"] for e in events], tempo, phase))
+    except Exception:
+        return None
+
+
+def _conf_of(hit):
+    """命中率 → 置信度文案。None 就是「未知」，别硬凑成「高」。"""
+    if hit is None:
+        return "未知"
+    return "高" if hit >= 0.85 else "中" if hit >= 0.70 else "低"
+
+
 def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
                          fixed_tempo=None, fixed_ts=None, fixed_note=None):
     """转谱事件（秒）→ 测速 → 重排 → 出谱。
@@ -1061,7 +1079,8 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
         if job.get("_omr_note"):
             grid = f"{grid} · {job['_omr_note']}"
         _finish(job, text, backend=backend_name,
-                extra={"confidence": conf, "hit": 100, "grid": grid, "doubled": 0,
+                extra={"confidence": conf, "hit": 100, "grid": grid,
+                       "doubled": int(why.get("doubled") or 0),
                        "audioq": job.get("_audioq"), "rubato": {"applied": False},
                        "tempo_alts": [], "bpm_guess": _int_or_none(bpm_guess),
                        "via_audio": bool(job.get("_via_audio"))})
@@ -1069,23 +1088,23 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
 
     if hint:
         tempo, phase, why = B.select_grid(events, tempo_hint=hint)
-        try:
-            hit = float(B.grid_quality([e["start"] for e in events], tempo, phase))
-        except Exception:
-            hit = 1.0
-        conf, doubled = "手动", int(why.get("doubled") or 0)
+        hit = _grid_hit(B, events, tempo, phase)
+        conf = "手动" if hit is not None else "手动·速度待核"
+        doubled = int(why.get("doubled") or 0)
         # 速度可能是文件名字里读回来的（我们导出的钢琴声），那句话要如实显示
         grid = job.pop("_tempo_note", None) or "手填速度"
         job["_cache"] = {"timebase": "sec", "events": events, "time_sig": "4/4"}
     else:
         tempo, phase, why = B.select_grid(events)
-        try:
-            hit = float(why.get("base_hit")
-                        or B.grid_quality([e["start"] for e in events], tempo, phase))
-        except Exception:
-            hit = 1.0
-        conf = "高" if hit >= 0.85 else "中" if hit >= 0.70 else "低"
+        hit = _grid_hit(B, events, tempo, phase, why.get("base_hit"))
+        conf = _conf_of(hit)
         doubled = int(why.get("doubled") or 0)
+        # 测速没把握时别让界面只显示一句「低」：速度错了整首都会错格，
+        # 这是"给错谱"里最贵的一种，必须说清"可能不准、请手填"。
+        if not why.get("ok", True):
+            _why_reason = str(why.get("reason") or "").strip()
+            if "速度" not in _why_reason:
+                why = dict(why, reason=(_why_reason or "自动测速") + "（速度可能不准）")
         # `why["head"]` 是数字（小节头命中率 0~1），`reason` 才是给人看的那句话。
         _head = why.get("head")
         _reason = str(why.get("reason") or "").strip()
@@ -1093,7 +1112,8 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
                 else _reason)
         job["_cache"] = {"timebase": "sec", "events": events, "time_sig": "4/4",
                          "auto": {"tempo": int(tempo), "phase": float(phase),
-                                  "hit": hit, "conf": conf, "grid": grid,
+                                  "hit": hit if hit is not None else 0.0,
+                                  "conf": conf, "grid": grid,
                                   "doubled": doubled}}
     _stage(job, "tempo", 1.0)
     _ck(job)
@@ -1420,21 +1440,28 @@ def _run_omr(job):
         # 真正有用的信息是「它没在这张图上找到谱表」——最常见的原因就是：
         # 这不是五线谱，而是 15 键数字谱截图（Sky Studio 那种），或者是照片/斜拍。
         low = (str(e) + " " + tail).lower()
-        not_staff = ("no regularly spaced lines" in low or "staff" in low
-                     or "process_image" in low or "traceback" in low
-                     or "homr 跑完了但没出" in low or "xml_gene" in low)
-        if not_staff:
+        # 只说「图上没有谱表」的那几句话，才能断言"不是五线谱"。
+        # 以前这里还匹配 `staff` / `traceback` / `process_image` / `xml_gene` ——
+        # 那些是引擎的栈帧名，磁盘满、权限、临时目录竞争崩掉时也会出现，
+        # 于是"引擎挂了"被说成"你的图不是五线谱"，用户白重拍一张其实没问题的谱。
+        no_staff = ("no regularly spaced lines" in low
+                    or "no staff" in low or "staff not found" in low
+                    or "no staves" in low or "没有谱表" in low
+                    or "homr 跑完了但没出" in low)
+        if no_staff:
             raise HumanError(
-                "这张图不是五线谱，认不了。",
+                "这张图里没找到五线谱的谱表，认不了。",
                 advice=["图片只认五线谱（带五条横线的钢琴谱、歌曲谱）。"
                         "简谱、光遇 15 键格子谱、照片里的其他东西，一律不转。",
                         "如果它确实是五线谱，正对镜头重拍一张或者用扫描件，别斜、别压阴影。",
                         "要把曲子转成 15 键谱，就传音频；要精确，就直接拖 MusicXML。"],
                 code="not_score_image") from e
-        raise HumanError("识谱引擎跑完了，但没能导出谱面。",
-                         advice=["换一张更清晰、正对镜头拍的谱面图（别斜拍、别压阴影）；",
-                                 "或者直接拖 MusicXML 进来，比识图又快又准。",
-                                 f"引擎原话：{tail[:160]}"]) from e
+        raise HumanError("识谱引擎这次没跑通 —— 不是图不对，是引擎自己出错了。",
+                         advice=["先重试一次：这类失败多是临时目录/进程竞争，第二次通常就好了；",
+                                 "还不行就换一张图；要精确就直接用打谱软件导出 MusicXML 拖进来，"
+                                 "比识图又快又准。",
+                                 f"引擎原话：{tail[:200]}"],
+                         code="omr_failed") from e
     job["_omr_best"] = omr_best
     if omr_best.get("debug_notes"):
         job["_omr_debug"] = omr_best["debug_notes"]
@@ -1452,12 +1479,15 @@ def _run_omr(job):
     events, tempo_file, time_sig, _key = (
         parsed.events, parsed.tempo, parsed.time_sig, parsed.key)
     if not events:
-        raise HumanError("这张图不是五线谱，认不了。",
-                         advice=["图片只认五线谱（带五条横线的钢琴谱、歌曲谱）。"
-                                 "简谱、光遇 15 键格子谱、照片里的其他东西，一律不转。",
-                                 "如果它确实是五线谱，正对镜头重拍一张或者用扫描件。",
-                                 "要把曲子转成 15 键谱，就传音频；要精确，就直接拖 MusicXML。"],
-                         code="not_score_image")
+        # 走到这里说明引擎**成功吐了 MusicXML**，只是我们没从里面读出音符。
+        # 那可能是谱面真的空（整页休止），也可能是解析器跟不上某个写法 ——
+        # 这两种都不该说成"你的图不是五线谱"。
+        raise HumanError("识谱跑完了，也生成了谱面文件，但从里面没读出任何音符。",
+                         advice=["先重试一次；两次都一样就说明这张谱的写法我们没吃透。",
+                                 "改用 MusicXML 最省事：用 MuseScore 之类打谱软件打开这首曲子、"
+                                 "导出 .musicxml 再拖进来。",
+                                 f"（引擎产出的文件：{str(made)[:180]}）"],
+                         code="omr_empty")
     # 兜底：homr 偶尔会在非五线谱的图上"成功"吐出几个音（照片、插图、稀疏的谱页边角）。
     # 五线谱真实谱页实测最少也有上百个音；这里按「少得不像谱」判，宁可挡住也不给假谱。
     try:
@@ -1739,7 +1769,7 @@ class App(SimpleHTTPRequestHandler):
             # 注意：`/` 本身是首页，SimpleHTTPRequestHandler 会自己映射到 index.html，
             # 所以这里只拦「以 / 结尾但不是根」的目录请求，别把首页拦掉。
             pu = urllib.parse.unquote(p)                             # 防 %2e%2e / %2f 绕过
-            segs = pu.replace("\\", "/").split("/")                # Windows 上 \ 也是分隔符
+            segs = pu.replace("\\", "/").split("/")                  # Windows 上 \ 也是分隔符
             last = segs[-1].lower()
             if (".." in segs or pu.startswith("/.") or (p != "/" and p.endswith("/"))
                     or last.endswith((".py", ".pyc", ".bat", ".log", ".json", ".pth"))):

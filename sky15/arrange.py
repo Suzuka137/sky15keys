@@ -622,12 +622,21 @@ def arrange(events, tempo=120, time_sig="4/4", key=None, title="",
     lh_synth   : True 时允许在低音区**合成**一个根音（本格真的没有根音时）。
                  编配里这是常规做法，但会引入输入里不存在的音，默认关。
     """
+    _n_in = len(events)
     if events:
         # 越界音高直接丢：Transkun 会吐出 pitch=-64 这种非钢琴音（实测 190,930 个
         # 事件里 3,152 个越界，占 1.65%，且 vel=127、时值长达 2~3 秒）。这类事件
         # 会被 layout.snap 折成随便一个音，还会因为 vel=127 抢占"旋律"位置。
         # 它们都出现在真实音存在的时刻，丢掉不损失内容。
         events = [e for e in events if 21 <= int(e.get("pitch", 60)) <= 108]
+        # 但"全丢光"和"丢了几个"是两件事。以前这里一声不响往下走，最后返回一份
+        # 语法完全合法、`曲谱:[]` 的空谱 —— 用户拖一张图进来，看到的是一张排版
+        # 正常、一个音都没有的谱，界面上"音符 0"和"成功"同时存在。
+        # `_run_omr` / `_run_score` 的空判都在调用 arrange **之前**，拦不住这一步。
+        if not events:
+            raise ValueError(
+                "这 %d 个音的音高全部落在 A0~C8（MIDI 21~108）之外，没能出谱。"
+                "常见原因：谱号/8vb 被识错、或者转谱把休止符写成了 C0。" % _n_in)
     if events:
         events = [e for e in events
                   if e.get("dur", 0) >= drop_short and e.get("vel", 90) >= min_vel]

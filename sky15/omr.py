@@ -907,7 +907,12 @@ def _run_audiveris(src, outdir, timeout=600, extra_env=None, keep_log=True):
         env.update(extra_env)
     t0 = time.time()
     try:
+        # `text=True` 不写 encoding 就用系统默认编码（Windows 上是 cp936/GBK），
+        # 而 Audiveris 是 Java 程序、输出 UTF-8。中文谱名/中文日志一旦出现在
+        # stdout 里就会解成乱码，运气不好直接 UnicodeDecodeError。
+        # 另一处（homr，:1160 附近）一直是显式 utf-8 的，这里对齐。
         proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
                               timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         raise RuntimeError(

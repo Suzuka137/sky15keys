@@ -221,7 +221,7 @@ def fit_grid(onsets, tempo_hint=None, verbose=False):
     return bpm, ph, R
 
 
-def fix_tempo_octave(onsets, tempo, min_ratio=0.72, max_double=2):
+def fix_tempo_octave(onsets, tempo, min_ratio=0.72, max_double=2, gate=0.05):
     """用「最小音符间隔」判断速度是不是估成了倍速，必要时翻倍。
 
     为什么有效：转录出来的 onset 密度是有实际下限的 —— 音与音之间不可能比
@@ -248,6 +248,17 @@ def fix_tempo_octave(onsets, tempo, min_ratio=0.72, max_double=2):
     p10 = float(np.percentile(ioi, 10))
 
     times = 0
+
+    def _gq(t):
+        """这个速度下网格有多整齐（容差 0.2 格的命中率，相位取最优）。"""
+        t = _t(t)
+        try:
+            slot_t = 30.0 / t
+            ph = refine_phase(on.tolist(), t, float(on[0] % slot_t))
+            return float(grid_quality(on.tolist(), t, ph))
+        except Exception:
+            return 0.0
+
     for _ in range(max_double):
         slot = 30.0 / _t(tempo)
         if p10 < min_ratio * slot:
@@ -256,6 +267,68 @@ def fix_tempo_octave(onsets, tempo, min_ratio=0.72, max_double=2):
         else:
             break
     return tempo, times
+
+
+def _with_ok(why, onsets, tempo, phase):
+    """在 why 里补一份 `ok` 与算准的 `base_hit`。
+
+    `ok=False` 的意思是「速度没测准，别信这个数」——以前只有一句 reason 文本，
+    任务状态照样 done，脚本/批处理侧拿不到任何失败信号，谱却整首错格。
+    """
+    out = dict(why)
+    # 命中率必须按**最终的** (tempo, phase) 重算：`core` 里那个 `base_hit`
+    # 是用"翻倍前"的相位算的，速度一换相位就偏三成，那个数会低到 0.1 ——
+    # 拿它判 `ok` 会把"倍速纠正做对了"的曲子判成不可信（实测 14/41/5 号）。
+    hit = None
+    try:
+        hit = float(grid_quality(onsets, tempo, phase))
+    except Exception:
+        hit = None
+    if hit is None:
+        hit = out.get("base_hit")
+    if not isinstance(hit, (int, float)):
+        try:
+            hit = grid_quality(onsets, tempo, phase)
+        except Exception:
+            hit = 0.0
+    try:
+        hit = float(hit)
+    except (TypeError, ValueError):
+        hit = 0.0
+    out["base_hit"] = round(hit, 3)
+    # 宽命中率（容差 0.2 格）对随机输入也很给面子：随机 40 个音实测 0.625。
+    # 所以再加一道紧容差（0.08 格）—— 真节奏 1.000，随机 0.35，噪声分得开。
+    # 等间隔输入两边都是 1.000，那是信息本来就够不到（等间隔没有拍信息），
+    # 该走 alts 让用户点，不算"测错"，所以这里判 True。
+    tight = 1.0
+    if len(onsets) <= 5000:
+        try:
+            tight = float(_tight_hit(list(onsets), tempo))
+        except Exception:
+            tight = 1.0
+    out["tight_hit"] = round(tight, 3)
+    # 少于 8 个音本来就走"太短，用默认"；命中率不到 0.3 说明格子跟音符对不上。
+    out["ok"] = bool(len(onsets) >= 8 and hit > 0.3 and tight > 0.5)
+    # 最后一道：最终速度跟初测差太多就标不可信。
+    #
+    # 为什么不拦（只在事后标记）：我用「翻倍必须让网格更整齐」当闸门试过，
+    # 48 首里直接打坏一首（41 号 210→315）—— 因为 `grid_quality` 是容差 0.2 格
+    # 的宽判据，格子砍半时所有音照样落得进去，命中率反而更高（41 号实测
+    # 105 BPM 0.990 / 210 BPM 0.692）。紧容差 `_tight_hit` 也分不开：
+    # 该翻的 41 号只涨 0.008，不该翻的 16 号却涨 0.036，两者重叠。
+    # 原来的 `p10/slot < 0.72` 在 48 首上是全对的，所以判据不动；
+    # 只把"改得离谱"这件事暴露出来，让界面提示用户点候选确认。
+    t_fit = out.get("t_fit")
+    if isinstance(t_fit, (int, float)) and float(t_fit) > 0:
+        ratio = float(tempo) / float(t_fit)
+        out["ratio"] = round(ratio, 2)
+        if ratio >= 2.6 or ratio <= 1.0 / 2.6:
+            out["ok"] = False
+            _r = str(out.get("reason") or "").strip()
+            if "可能判错" not in _r:
+                out["reason"] = (_r or "自动测速") + (
+                    " · 速度跟初测差了 %.1f 倍，可能判错，请点候选确认" % ratio)
+    return out
 
 
 def select_grid(events, tempo_hint=None, tempo_min=40, tempo_max=260):
@@ -271,10 +344,20 @@ def select_grid(events, tempo_hint=None, tempo_min=40, tempo_max=260):
         # 搜索/纠倍速，实测 48 首里有 3 首把**正确的**提示改坏
         # （150→93.8、174→87 `_hintcheck.py`）。表现就是"我改调性，速度也跟着变"。
         hint = _t(tempo_hint)
+        # 入口必须挡一下。`_t` 只夹到 10~1000 BPM，而这里的约定是
+        # tempo_min~tempo_max（40~260）；不挡的话传 1000 就真按 1000 出谱，
+        # 一个格 0.03 秒，整首挤成一小段，状态还是 done。
+        clamped = min(max(float(hint), float(tempo_min)), float(tempo_max))
+        note = ""
+        if abs(clamped - float(hint)) > 1e-6:
+            note = "（你填的 %g 超出 %g~%g，按 %g 算）" % (
+                float(hint), float(tempo_min), float(tempo_max), clamped)
+            hint = clamped
         ph = refine_phase(onsets, hint, phase)
         return hint, snap_phase(onsets, hint, ph), {
-            "reason": "按你填的速度", "head": "手填速度",
+            "reason": "按你填的速度" + note, "head": "手填速度",
             "base_hit": round(grid_quality(onsets, hint, ph), 3),
+            "ok": True,        # 用户自己定的速度，不拿命中率去质疑它
         }
     new_t, new_ph, info = pick_tempo_scale(onsets, tempo, phase)
     if abs(new_t - tempo) > 0.5:
@@ -282,13 +365,13 @@ def select_grid(events, tempo_hint=None, tempo_min=40, tempo_max=260):
         why = dict(why)
         why.update(info)
         why["tempo_before_scale"] = round(tempo, 1)
-        return new_t, snap_phase(onsets, new_t, ph), why
+        return new_t, snap_phase(onsets, new_t, ph), _with_ok(why, onsets, new_t, ph)
     # 速度没变也要把候选带出去：40 号(127 vs 254)、315 号(124 vs 166)就是
     # 先验判不出、只能让人点一下的两首，界面靠 why["alts"] 出候选按钮。
     if info.get("alts"):
         why = dict(why)
         why["alts"] = info["alts"]
-    return tempo, snap_phase(onsets, tempo, phase), why
+    return tempo, snap_phase(onsets, tempo, phase), _with_ok(why, onsets, tempo, phase)
 
 
 def _select_grid_core(events, tempo_hint=None, tempo_min=40, tempo_max=260):
@@ -306,8 +389,10 @@ def _select_grid_core(events, tempo_hint=None, tempo_min=40, tempo_max=260):
     """
     onsets = sorted(e["start"] for e in events if e.get("dur", 1) > 0)
     t0, o0, r0 = fit_grid(onsets, tempo_hint=tempo_hint)
+    t_fit = t0                     # 留一份初测值：最后要拿它判"改得离不离谱"
     if len(onsets) < 8:
-        return t0, o0, {"reason": "太短，用默认", "base_hit": round(r0, 3)}
+        return t0, o0, {"reason": "太短，用默认", "base_hit": round(r0, 3),
+                        "t_fit": round(t_fit, 2)}
 
     # 先修倍速：关键在于**这一步必须先做**。
     # 速度估成一半时，下面的"小节头对齐"会拿错的格子长度去对齐，
@@ -348,7 +433,8 @@ def _select_grid_core(events, tempo_hint=None, tempo_min=40, tempo_max=260):
         ph0 = refine_phase(onsets, t0, ph0)
         return t0, ph0, {"reason": "仅调相位", "head": round(head0, 3),
                          "doubled": doubled,
-                         "base_tempo": round(t0, 1), "base_hit": round(r0, 3)}
+                         "base_tempo": round(t0, 1), "base_hit": round(r0, 3),
+                         "t_fit": round(t_fit, 2)}
 
     # 第二步：小节头还是大面积空着 → 才怀疑倍速。
     # 而且要求**明显变好**才换：换倍速会改变播放速度，宁可留错也不能无谓地换。
@@ -366,7 +452,8 @@ def _select_grid_core(events, tempo_hint=None, tempo_min=40, tempo_max=260):
     return tempo, phase, {"reason": "小节头对齐" if factor != 1.0 else "仅调相位",
                           "head": round(head, 3), "factor": factor,
                           "doubled": doubled,
-                          "base_tempo": round(t0, 1), "base_hit": round(r0, 3)}
+                          "base_tempo": round(t0, 1), "base_hit": round(r0, 3),
+                          "t_fit": round(t_fit, 2)}
 
 
 def refine_phase(onsets, tempo, phase, span=0.5):
@@ -592,6 +679,9 @@ def _tight_hit(onsets, tempo, tol=0.08, span=1.6, step=0.02):
     """
     tempo = _t(tempo)
     import numpy as np
+    onsets = np.asarray(onsets, dtype=float).reshape(-1)
+    if onsets.size == 0:
+        return 0.0          # 空输入：以前 np.mean 空切片会吐 nan 并打 RuntimeWarning
     slot = 30.0 / _t(tempo)
     best = 0.0
     for o in np.arange(-span, span + 1e-9, step) * slot:
