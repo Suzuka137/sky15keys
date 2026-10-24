@@ -1736,8 +1736,12 @@ class App(SimpleHTTPRequestHandler):
             # 静态根就是 web\ 目录本身，server.py / midiout.py / scoreio.py 都躺在旁边。
             # 以前 GET /server.py 能直接把源码下走（含 SAFE_EXT、_REN_VER、路径布局），
             # 跟任何路径类问题配合都更好利用。这里只放行前端真需要的静态资源。
-            last = p.rsplit("/", 1)[-1].lower()
-            if (".." in p or p.startswith("/.") or p.endswith("/")
+            # 注意：`/` 本身是首页，SimpleHTTPRequestHandler 会自己映射到 index.html，
+            # 所以这里只拦「以 / 结尾但不是根」的目录请求，别把首页拦掉。
+            pu = urllib.parse.unquote(p)                             # 防 %2e%2e / %2f 绕过
+            segs = pu.replace("\\", "/").split("/")                # Windows 上 \ 也是分隔符
+            last = segs[-1].lower()
+            if (".." in segs or pu.startswith("/.") or (p != "/" and p.endswith("/"))
                     or last.endswith((".py", ".pyc", ".bat", ".log", ".json", ".pth"))):
                 return self._err(404, "没有这个文件")
             return super().do_GET()
