@@ -84,14 +84,47 @@ def transcribe(audio_path, backend=None, device=None, **kw):
 
     backend = backend or auto_backend()
     if backend == "piano":
-        return (*_piano(wav, device, **kw), "piano_transcription")
-    if backend == "transkun":
-        return (*_transkun(wav, device, **kw), "transkun")
-    if backend == "basic":
-        return (*_basic(wav), "basic_pitch")
-    if backend == "librosa":
-        return (*_librosa(wav), "librosa_pyin")
-    raise RuntimeError("没有可用的转谱后端，见 install 说明")
+        ev, bpm = _piano(wav, device, **kw)
+        name = "piano_transcription"
+    elif backend == "transkun":
+        ev, bpm = _transkun(wav, device, **kw)
+        name = "transkun"
+    elif backend == "basic":
+        ev, bpm = _basic(wav)
+        name = "basic_pitch"
+    elif backend == "librosa":
+        ev, bpm = _librosa(wav)
+        name = "librosa_pyin"
+    else:
+        raise RuntimeError("没有可用的转谱后端，见 install 说明")
+    return clean_events(ev), bpm, name
+
+
+# 钢琴模型的合法音域：A0(21) ~ C8(108)。范围外的都是模型的"休止/无效"占位符，
+# 不是音。实测（2026-10-24，用户那条 274 秒的视频）Transkun 会吐 pitch = −64、
+# vel = 127、时值 57 秒这种事件，一首里 4 个。它们不发音，但会：
+#   1) 混进 beats 的 onset 列表（`dur > 0` 就收），把格子的相位带偏 ——
+#      实测同一份音频相位从 0.026 秒变成 0.059 秒（一个格 0.1875 秒，偏 18%），
+#      表现就是"开头前几个音位置对不上"；
+#   2) 让音符数虚高，用户看到的"多少音"里混进根本不存在的音。
+# 所以在唯一的出口处统一过一遍，各后端都受益。
+PITCH_LO, PITCH_HI = 21, 108
+LAST_DROPPED: dict = {"n": 0, "sample": []}
+
+
+def clean_events(events):
+    """丢掉音域外的假事件和零时值事件，顺手记下丢了几个备查。"""
+    keep, drop = [], []
+    for e in events or []:
+        try:
+            p = int(e.get("pitch", 0))
+            d = float(e.get("dur", 1) or 0)
+        except (TypeError, ValueError):
+            continue
+        (keep if (PITCH_LO <= p <= PITCH_HI and d > 0) else drop).append(e)
+    LAST_DROPPED["n"] = len(drop)
+    LAST_DROPPED["sample"] = drop[:4]
+    return keep
 
 
 OLD_PARAMS = dict(onset=_OLD["onset"], offset=_OLD["offset"],
