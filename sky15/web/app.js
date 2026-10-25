@@ -942,7 +942,9 @@
     if (r && r.tempo) $('#tune-tempo').value = String(r.tempo);
     $('#tune-chords').value = p.chords || 'auto';
     $('#tune-maxnotes').value = String(p.max_notes || 3);
-    /* 调性不在这里改了 —— 谱面调性一律自动判（全库 80/80）。
+    /* 调性不在这里改了 —— 谱面调性由 arrange.pick_key 自动判；领先不足 0.05
+       时再让 music21 兜底，走完整排谱是全库 80/80（只算几何得分是 77/80）。
+       两个数别混：删掉兜底会掉到 77，一律信 music21 会掉到 75。
        "换调听"挪到 15 键面板的「弹奏调性」，只改发声，不改谱子。 */
     var _oc = $('#tune-octave');
     if (_oc) _oc.value = (p.octave === 'mel' ? 'mel' : p.octave === 'auto' ? 'auto' : 'off');
