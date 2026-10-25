@@ -17,11 +17,18 @@
     opts = opts || {};
     this.onTick = opts.onTick || function () {};
     this.onState = opts.onState || function () {};
+    /* 播完（整首走到底）单独发一次，别让界面去猜。以前展示页拿
+       `idleSlot >= slots.length - 1` 反推，结果「在最后一格上按暂停」也被当成播完，
+       红杠会滑到末尾、再按空格变成从头重播（2026-10-25 审查发现）。 */
+    this.onEnd = opts.onEnd || function () {};
+    this.onWarn = opts.onWarn || function () {};
 
     this.ctx = null;
     this.bus = null;
     this.buffers = {};        // midi -> AudioBuffer（null 表示这条没采样）
     this.loading = {};        // midi -> Promise
+    this._live = [];          // 已经排进 ctx 还没响完的音源：暂停/跳转时要掐掉
+    this._rebase = false;     // ctx 被重建过，nextTime 的时间轴要跟着换
 
     this.slots = [];          // [[midi, midi...], ...]
     this.perBar = 8;
@@ -62,10 +69,21 @@
        createBufferSource 会抛 InvalidStateError。那一下如果发生在 play() 里，
        playing 已经置成 true，就再也不会自己变回来 —— 表现就是「怎么点都没反应」。
        所以发现 closed 就丢掉重建（2026-10-25 用户报的）。 */
-    if (this.ctx && this.ctx.state === 'closed') { this.ctx = null; this.bus = null; }
+    if (this.ctx && this.ctx.state === 'closed') {
+      this.ctx = null;
+      this.bus = null;
+      /* 新 ctx 的 currentTime 从 0 重新计时，而 nextTime 记的是**旧 ctx 的时间轴**。
+         不搬过来，下一个 tick 就会觉得"还早得很"，从此一个音都不排：界面显示在播、
+         一点声音没有、红杠被 playhead() 钳在页首（2026-10-25 审查发现的）。 */
+      this._rebase = true;
+    }
     if (this.ctx) return this.ctx;
     var AC = window.AudioContext || window.webkitAudioContext;
     this.ctx = new AC({ latencyHint: 'interactive' });
+    if (this._rebase) {
+      this._rebase = false;
+      this.nextTime = this.ctx.currentTime + 0.02;
+    }
     // 一压一收，多音同时响不至于糊成一团（照抄原站总线）
     var comp = this.ctx.createDynamicsCompressor();
     if (comp.threshold) comp.threshold.value = -14;
@@ -96,18 +114,21 @@
 
   Player.prototype.preload = function (midis) {
     var self = this;
-    var ctx = this.ensure();
+    this.ensure();
     (midis || []).forEach(function (midi) {
       if (!self.sampleUrl(midi)) { self.buffers[midi] = null; return; }
       if (midi in self.buffers || midi in self.loading) return;
       var p = fetch(self.sampleUrl(midi))
         .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
         .then(function (buf) {
-          if (!buf) { self.buffers[midi] = null; return null; }
-          return new Promise(function (ok, bad) { ctx.decodeAudioData(buf, ok, bad); });
+          if (!buf) { self.buffers[midi] = null; return null; }   // 404：这条确实没有，别重试
+          // 用**当前**的 ctx 解码：ctx 中途被重建过的话，拿旧 ctx 解会失败
+          return new Promise(function (ok, bad) { self.ensure().decodeAudioData(buf, ok, bad); });
         })
-        .then(function (ab) { self.buffers[midi] = ab || null; })
-        .catch(function () { self.buffers[midi] = null; })
+        .then(function (ab) { if (ab) self.buffers[midi] = ab; })
+        /* 解码失败（多半是 ctx 被换掉了）不能记成"这条没有采样"，否则这个音在整个
+           会话里都只剩振荡器兜底、再也不重试（2026-10-25 审查发现）。删掉，下次再解。 */
+        .catch(function () { delete self.buffers[midi]; })
         .then(function () { delete self.loading[midi]; });
       self.loading[midi] = p;
     });
@@ -124,7 +145,13 @@
       src.buffer = buf;
       src.connect(this.bus);
       src.start(t);
-      // ★ 不调 src.stop()：5 秒采样自然放完，这是原站行为
+      /* 正常情况不 stop：5 秒采样自然放完，这是原站行为。
+         但暂停/拖进度条/翻页那一下要掐掉已经排进来的残留（最多 AHEAD 150ms），
+         否则旧位置的音和新位置的音会叠在一起响 —— 见 _cut()。 */
+      this._live.push({ node: src, t: t });
+      if (this._live.length > 96) {
+        this._live = this._live.filter(function (x) { return x.t > ctx.currentTime - 6; });
+      }
       return;
     }
 
@@ -154,6 +181,17 @@
       og.gain.value = parts[k][1];
       o.connect(og); og.connect(g);
       o.start(t); o.stop(t + len + 0.02);   // 振荡器可以停，采样不行
+      this._live.push({ node: o, t: t });
+    }
+  };
+
+  /* 掐掉「已经排进去、还没响完」的音（暂停 / 跳转 / 翻页时用）。
+     采样源本来不许随便 stop，但这里要的正是「立刻不响」，所以停。 */
+  Player.prototype._cut = function () {
+    var list = this._live || [];
+    this._live = [];
+    for (var i = 0; i < list.length; i++) {
+      try { list[i].node.stop(0); } catch (e) { }
     }
   };
 
@@ -172,6 +210,7 @@
 
   /* ---------- 装载 ---------- */
   Player.prototype.load = function (data) {
+    var wasPlaying = this.playing;
     this.pause(true);
     this.slots = data.slots || [];
     /* 谱面上写的键位（第几个键）。发声可以因为 (8vb) 低一个八度，
@@ -184,6 +223,9 @@
     this.idleSlot = 0;
     this._lastSlot = -1;
     this.onTick(this.info(0));
+    /* 换谱前是在播的：静默的 pause(true) 不发 onState，界面那边 S.playing 会永远
+       卡在 true（第一次按空格被当成"暂停"、录屏也起不了播）。这里补一句。 */
+    if (wasPlaying) this.onState(false);
     return this;
   };
 
@@ -225,11 +267,23 @@
   /* ---------- 调度 ---------- */
   Player.prototype._pump = function () {
     if (!this.playing) return;
-    var ctx = this.ctx;
+    /* ctx 被浏览器关掉时（休眠、音频设备被回收）currentTime 就冻住了：
+       不主动重建，这里会一直算"还早"，下一个音永远排不进去（2026-10-25 审查的致命项）。
+       重建时 ensure() 会把 nextTime 搬到新 ctx 的时间轴上。 */
+    if (this.ctx && this.ctx.state === 'closed') this.ensure();
     var sd = this.slotDur();
     var range = this.loopRange();
     var guard = 0;
-    while (this.nextTime < ctx.currentTime + AHEAD && guard++ < 64) {
+    /* 标签页被节流、或者电脑睡了一觉再回来，nextTime 会停在很远的过去。
+       这时候「把欠的格子补出来」只会把几十格堆在同一瞬间炸成一堵和弦墙，
+       所以直接把欠账跳过（2026-10-25 审查发现的）。 */
+    var now0 = this.ctx ? this.ctx.currentTime : 0;
+    if (this.nextTime < now0 - 0.2) {
+      var skipped = Math.floor((now0 - this.nextTime) / sd);
+      if (skipped > 0 && !range) this.i += skipped;
+      this.nextTime = now0 + 0.02;
+    }
+    while (this.nextTime < (this.ctx ? this.ctx.currentTime : 0) + AHEAD && guard++ < 64) {
       if (range && this.i >= range[1]) this.i = range[0];
       if (this.i >= this.slots.length) { this.finish(); return; }
       var t = this.nextTime;
@@ -272,8 +326,11 @@
     var range = this.loopRange();
     if (this.i >= this.slots.length || this.i < 0) this.i = range ? range[0] : 0;
     if (range && this.loop && (this.i < range[0] || this.i >= range[1])) this.i = range[0];
-    this.nextTime = ctx.currentTime + 0.08;
+    /* 0.08 太长：playhead() 会算成 i - 0.08/slotDur，落在上一格，右侧键盘会先亮错一格。
+       0.02 足够给调度留余量，又不会跨格。 */
+    this.nextTime = ctx.currentTime + 0.02;
     this.playing = true;
+    this._lastSlot = -1;
     var self = this;
     /* 起播这一段必须能回滚：_pump 里要 createBufferSource / createGain，
        音频设备被回收时会抛。抛了却不把 playing 改回 false，下一次 toggle()
@@ -281,7 +338,12 @@
        （2026-10-25 用户报的）。 */
     try {
       this._pump();
-      this.timer = setInterval(function () { self._pump(); self._tick(); }, TICK_MS);
+      this.timer = setInterval(function () {
+        /* 定时器里的异常没人接 = playing 永远停在 true、每 30ms 抛一次，只能靠用户
+           再按一次空格复位（2026-10-25 审查发现）。出错就地停住并报一句。 */
+        try { self._pump(); self._tick(); }
+        catch (e) { self.pause(); self.onWarn('播放中断了：' + (e && e.message ? e.message : e)); }
+      }, TICK_MS);
       this._frame();
     } catch (e) {
       this.playing = false;
@@ -297,16 +359,26 @@
     this.playing = false;
     if (this.timer) { clearInterval(this.timer); this.timer = 0; }
     if (this.raf) { cancelAnimationFrame(this.raf); this.raf = 0; }
+    /* 已经排进 ctx 的音（最多超前 150ms）要掐掉：不掐的话「暂停、再播」会把正在响的
+       那一格重排一遍，听上去是同一个音重了一下（2026-10-25 审查发现）。 */
+    this._cut();
     this.idleSlot = Math.floor(head);
     this.i = this.idleSlot;
+    this._lastSlot = -1;
     if (!silent) { this.onState(false); this.onTick(this.info(this.idleSlot)); }
   };
 
   Player.prototype.finish = function () {
+    /* 播完停在最后一个音上，别把播放头归零 —— 归零会让展示页的红杠瞬移回页首
+       （2026-10-25 用户报的）。要回到开头是界面的事（重播 / 从头播自己 seek），
+       播放器不替它决定。 */
+    var end = Math.max(0, this.slots.length - 1);
     this.pause();
-    this.idleSlot = 0;
-    this.i = 0;
-    this.onTick(this.info(0));
+    this.idleSlot = end;
+    this.i = end;
+    this.onTick(this.info(end));
+    /* 播完要单独说一声：界面靠这个点亮「停住别再跳」，而不是去猜 idleSlot */
+    this.onEnd();
   };
 
   Player.prototype.toggle = function () {
@@ -317,6 +389,7 @@
     var range = this.loopRange();
     var max = Math.max(0, this.slots.length - 1);
     slot = clamp(Math.round(slot), 0, max);
+    this._cut();   // 拖到新位置就先别让旧位置的音继续响
     this.i = slot;
     this.idleSlot = slot;
     this._lastSlot = -1;
@@ -339,7 +412,9 @@
     this.rate = r;
     if (was) {
       this.i = clamp(Math.floor(head) + 1, 0, Math.max(0, this.slots.length - 1));
-      this.nextTime = this.ctx.currentTime + 0.06;
+      /* 别把 nextTime 往回压：那会让下一格提前起拍、当前格被截短（审查发现）。
+         只保证它不落在过去。 */
+      this.nextTime = Math.max(this.nextTime, this.ctx.currentTime + 0.02);
     }
     this.onTick(this.info(Math.floor(head)));
   };
