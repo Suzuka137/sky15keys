@@ -1143,7 +1143,7 @@ def to_musicxml_homr(image_path, outdir=None, timeout=420, on_step=None,
         LAST_DEBUG["notes"] = None
         LAST_DEBUG["all"] = []
 
-        made, secs = [], 0.0
+        made, secs, skipped = [], 0.0, []
         for i, img in enumerate(imgs, 1):
             sub = td / f"p{i:03d}"
             sub.mkdir(parents=True, exist_ok=True)
@@ -1183,15 +1183,28 @@ def to_musicxml_homr(image_path, outdir=None, timeout=420, on_step=None,
                 LAST_DEBUG["all"] += [str(p) for p in sorted(sub.glob("*_debug_*.png"))]
             got = sorted(sub.glob("*.musicxml"))
             if not got:
-                raise RuntimeError(
-                    f"第 {i}/{pages} 页 homr 跑完了但没出 MusicXML"
-                    f"（返回码 {proc.returncode}，{dt:.1f}s）\n"
-                    f"{(proc.stderr or proc.stdout or '')[-700:].strip()}")
+                # 多页 PDF 里夹一页封面/目录/空白太常见了。以前这里直接抛异常，
+                # 一页封面就让整份谱子全废 —— 5 页的谱子拍张封面就白跑。
+                # 现在记下来、跳过、继续下一页；但**必须明确说出来**（say 会同时
+                # 进 LAST_HOMR["warnings"] 和 web 的提示），不能静默丢页，否则
+                # 用户会以为整份都识别过了。所有页都没出谱才在下面统一报错。
+                tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+                why = tail[-1][:160] if tail else "引擎没有输出任何东西"
+                skipped.append(f"第 {i}/{pages} 页：返回码 {proc.returncode}，"
+                               f"{dt:.1f}s，{why}")
+                say(f"第 {i}/{pages} 页没认出谱面，已跳过（{why}）")
+                if pages > 1:
+                    step(f"第 {i}/{pages} 页没认出谱面，跳过", {"sec": round(dt, 1)})
+                continue
             made.append(got[0])
             if pages > 1:
                 step(f"第 {i}/{pages} 页完成（{dt:.1f}s）", {"sec": round(dt, 1)})
         if not made:
-            raise RuntimeError("homr 没有产出任何 MusicXML")
+            raise RuntimeError(
+                "homr 一页都没认出谱面。\n"
+                + ("\n".join("  · " + s for s in skipped)
+                   if skipped else "  · 引擎没有任何输出") +
+                "\n  可能原因：图太小/太糊、不是五线谱、或者整份都是封面。")
 
         dst = outdir / (src.stem + "_homr.musicxml")
         if len(made) == 1:
@@ -1303,12 +1316,17 @@ def score_musicxml(path) -> dict:
             "score": round(score, 5)}
 
 
-def _too_weak(info, min_notes=20, min_cover=0.5):
+def _too_weak(info, min_notes=8, min_cover=0.5):
     """识别结果太寒酸时给一句中文说明（None = 过闸）。
 
     只有覆盖率没有绝对下限 = "3 个音、覆盖 5%" 也算成功（审计 A 实测）。
     `min_notes` / `min_cover` 传 0 可以关掉对应那一条。自定义 scorer 返回的
     dict 里没有 notes/cover 时跳过那一条，不动老调用方。
+
+    下限从 20 降到 8（2026-10-25）：写死 20 会把 4 小节的练习曲直接判失败
+    （那种曲子本来就只有 8~12 个音），用户拿手机拍一段练习曲就中。真正要拦
+    的「整首只认出三五个音的碎片」由 `cover` 接住 —— 实测 3 音碎片的有音时间
+    只占 15%，远在 50% 红线之下，不需要靠音数硬顶。
     """
     bad = []
     if min_notes and "notes" in info and int(info.get("notes") or 0) < min_notes:
@@ -1323,7 +1341,7 @@ def _too_weak(info, min_notes=20, min_cover=0.5):
 
 def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
                      scorer=None, on_step=None, engines=("homr",),
-                     keep_debug=False, min_notes=20, min_cover=0.5, **kw):
+                     keep_debug=False, min_notes=8, min_cover=0.5, **kw):
     """图片 → MusicXML，多个引擎/多个放大倍数都跑一遍，取最好的那份。
 
     默认只用 homr（2026-10-23 用户定的：只留 homr，Audiveris 从识别流程里撤掉）。
@@ -1431,8 +1449,7 @@ def to_musicxml_best(image_path, outdir=None, scales=(1.0, 1.5, 2.0, None),
             "  可能原因：图太小/太糊、不是五线谱、裁掉了谱面。\n"
             "  下一步：preprocess_image 把 interline 放大到 15~20px 再跑；"
             "确认是整页谱而不是局部截图。\n"
-            "  确认这就是一份短谱的话，显式放宽：min_notes=0, min_cover=0。\n"
-            + weak)
+            "  确认这就是一份短谱的话，显式放宽：min_notes=0, min_cover=0。\n"            + weak)
     best["tries"] = [{k: v for k, v in t.items() if k != "mxl"} for t in tries]
     step(f"选用 {best['engine']}（覆盖 {100 * best['cover']:.1f}%，"
          f"{best['notes']} 音）", best)
