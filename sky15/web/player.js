@@ -354,14 +354,16 @@
     this.onState(true);
   };
 
-  Player.prototype.pause = function (silent) {
+  Player.prototype.pause = function (silent, keepTail) {
     var head = this.playhead();
     this.playing = false;
     if (this.timer) { clearInterval(this.timer); this.timer = 0; }
     if (this.raf) { cancelAnimationFrame(this.raf); this.raf = 0; }
     /* 已经排进 ctx 的音（最多超前 150ms）要掐掉：不掐的话「暂停、再播」会把正在响的
-       那一格重排一遍，听上去是同一个音重了一下（2026-10-25 审查发现）。 */
-    this._cut();
+       那一格重排一遍，听上去是同一个音重了一下（2026-10-25 审查发现）。
+       只有一处例外：整首播完时 keepTail=true —— 最后一个音该自己响完（采样最长 5 秒），
+       不然结尾听起来是被硬切掉的（2026-10-25 用户报的）。 */
+    if (!keepTail) this._cut();
     this.idleSlot = Math.floor(head);
     this.i = this.idleSlot;
     this._lastSlot = -1;
@@ -373,9 +375,12 @@
        （2026-10-25 用户报的）。要回到开头是界面的事（重播 / 从头播自己 seek），
        播放器不替它决定。 */
     var end = Math.max(0, this.slots.length - 1);
-    this.pause();
+    /* silent + keepTail：不自己发 onState（下面统一发一次），也不掐掉还在响的
+       最后一个音的尾巴 —— 红杠停住，声音自然收尾（2026-10-25 用户报的）。 */
+    this.pause(true, true);
     this.idleSlot = end;
     this.i = end;
+    this.onState(false);
     this.onTick(this.info(end));
     /* 播完要单独说一声：界面靠这个点亮「停住别再跳」，而不是去猜 idleSlot */
     this.onEnd();
