@@ -145,8 +145,6 @@
       '      <span class="ed-sep"></span>',
       '      <button id="ed-ins" class="btn small">插入空拍</button>',
       '      <button id="ed-del" class="btn small">删掉这一拍</button>',
-      '      <button id="ed-insrow" class="btn small ghost">插入空行</button>',
-      '      <button id="ed-delrow" class="btn small ghost">删掉这一行</button>',
       '    </div>',
       '  </div>',
       '  <div class="ed-right">',
@@ -180,8 +178,6 @@
     $('#ed-next').onclick = function () { gotoPage(ST.page + 1); };
     $('#ed-ins').onclick = function () { insertSlots(1); };
     $('#ed-del').onclick = function () { deleteSlots(1); };
-    $('#ed-insrow').onclick = function () { insertSlots(perRowSlots()); };
-    $('#ed-delrow').onclick = function () { deleteSlots(perRowSlots()); };
     $('#ed-save').onclick = function () { save(); };
     $('#ed-play').onclick = togglePlay;
     $('#ed-home').onclick = function () { seekSlot(0); };
@@ -196,8 +192,9 @@
       ks.onchange = function () {
         ST.soundKey = this.value || '';
         ST.rev += 1;                 // 换调要重载发声
+        // refreshPlayer() 自己会把播放头放回原处，这里不要再 seek(ST.sel) ——
+        // 那会把红杠拉到选中格上，和「红杠只由 E 控制」冲突（2026-10-25 修）。
         refreshPlayer();
-        try { ST.player && ST.player.seek(ST.sel); } catch (e) { }
       };
     }
     $('#ed-tempo').onchange = function () {
@@ -651,6 +648,9 @@
     if (!ST.player) return;
     if (ST.loadedRev === ST.rev) return;
     var base = soundBase();
+    // load() 里面会 onTick(info(0))，把 ST.phSlot 冲成 0 —— 先存下来，load 完再补回去。
+    // 不存的话「改完音符点继续播放」会从开头放（2026-10-25 用户报的）。
+    var keep = ST.phSlot;
     ST.player.load({
       slots: ST.slots.map(function (s) {
         return charsOf(s).map(function (c) { return midiOfIndex(CHARS.indexOf(c), base); });
@@ -663,9 +663,10 @@
       tempo: ST.meta.tempo || 120
     });
     ST.loadedRev = ST.rev;
+    ST.phSlot = keep;
     // 重新载入后把播放头放回原来的位置（不是选中格）——
     // 用户 2026-10-25 定：只有按 E 才跳到选中列，其它情况播放头自己待着。
-    try { ST.player.seek(ST.phSlot); } catch (e) { }
+    try { ST.player.seek(keep); } catch (e) { }
     try { ST.player.preload(padMidis(base)); } catch (e) { }
   }
 
