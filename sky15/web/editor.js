@@ -172,6 +172,23 @@
   }
 
   var _wired = false;
+  var _padKeysBound = false;
+
+  /* 15 键面板：每次打开都要有一个「活的」实例。
+     以前它跟着 _wired 守卫只建一次，而 ST 每次 open() 都被 blank() 换成新对象 ——
+     于是第二次打开编辑器 ST.pad 是 null，播放不亮灯、点面板也不响，直到刷新页面。
+     （2026-10-26 用户报「改谱子那里的键盘不亮了」）
+     mount 上的旧 SVG 要清掉，否则新面板会叠在旧面板上面。 */
+  function ensurePad() {
+    if (!window.SkyPad) return;
+    var mount = $('#ed-pad');
+    if (!mount) return;
+    if (ST.pad && ST.pad.svg && mount.contains(ST.pad.svg)) return;   // 还活着
+    mount.innerHTML = '';
+    ST.pad = new SkyPad(mount, function (i) { padTap(i); });
+    // pad.js 的 bindKeys 是往 window 上挂监听，不能每开一次就多挂一份
+    if (!_padKeysBound) { _padKeysBound = true; ST.pad.bindKeys(); }
+  }
 
   // 播放器每次打开编辑器都要有：open() 里 ST = blank() 会把它清成 null，
   // 而下面 wire() 的 _wired 守卫会让第二次以后的调用提前返回 ——
@@ -199,6 +216,7 @@
     ST.cv = $('#ed-cv');
     ST.ctx = ST.cv.getContext('2d');
     ensurePlayer();
+    ensurePad();
     // #ed / #ed-cv 就是页面里固定的那几个，每次打开编辑器都会再调一次 wire()。
     // 以前 image.load 与 window.resize 在这里无脑 addEventListener，
     // 每开关一次就多挂一份闭包 —— 改几十次谱子之后每次 resize 要重排几十遍。
@@ -243,11 +261,6 @@
     window.addEventListener('resize', function () { if (isOpen()) layoutCanvas(); paint(); });
 
     document.addEventListener('keydown', onKey, true);
-
-    if (!ST.pad && window.SkyPad) {
-      ST.pad = new SkyPad($('#ed-pad'), function (i) { padTap(i); });
-      ST.pad.bindKeys();
-    }
   }
 
   function isOpen() { return ST && ST.el && !ST.el.classList.contains('hidden'); }
