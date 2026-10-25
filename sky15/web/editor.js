@@ -84,7 +84,12 @@
 
   /* ---------------- 打开 / 关闭 ---------------- */
   function open(jid, onSaved) {
+    // 留着上一个 player 实例：每次开编辑器都新建一个的话，AudioContext 会一直挂着，
+    // 浏览器上限就几个，开关几次之后就创建失败、播放没声音（2026-10-25 修）。
+    var keepPlayer = (ST && ST.player) || null;
+    try { if (keepPlayer) keepPlayer.pause(true); } catch (e) { }
     ST = blank();
+    ST.player = keepPlayer;
     ST.jid = jid;
     ST.onSaved = typeof onSaved === 'function' ? onSaved : null;
     ST.saved = false;
@@ -168,11 +173,32 @@
 
   var _wired = false;
 
+  // 播放器每次打开编辑器都要有：open() 里 ST = blank() 会把它清成 null，
+  // 而下面 wire() 的 _wired 守卫会让第二次以后的调用提前返回 ——
+  // 所以创建放在守卫之前，否则第二次打开就报「播放器还没准备好」（2026-10-25 用户报的）。
+  function ensurePlayer() {
+    if (ST.player || !window.SkyPlayer) return;
+    ST.player = new SkyPlayer({
+      onTick: function (info) { onTick(info); },
+      // 播放器自己发现没法播（比如谱里一个音都没有）时用它报一句
+      onWarn: function (m) { status(m); },
+      onState: function (on) {
+        ST.playing = !!on;
+        var b = $('#ed-play');
+        if (b) b.textContent = on ? '暂停' : '播放';
+        // 暂停不再把选中格挪到红杠上（用户 2026-10-25：选中列别跟着红杠跑）
+        paint();
+        paintNow();
+      }
+    });
+  }
+
   function wire() {
     ST.el = $('#ed');
     ST.img = $('#ed-img');
     ST.cv = $('#ed-cv');
     ST.ctx = ST.cv.getContext('2d');
+    ensurePlayer();
     // #ed / #ed-cv 就是页面里固定的那几个，每次打开编辑器都会再调一次 wire()。
     // 以前 image.load 与 window.resize 在这里无脑 addEventListener，
     // 每开关一次就多挂一份闭包 —— 改几十次谱子之后每次 resize 要重排几十遍。
@@ -218,21 +244,6 @@
 
     document.addEventListener('keydown', onKey, true);
 
-    if (!ST.player && window.SkyPlayer) {
-      ST.player = new SkyPlayer({
-        onTick: function (info) { onTick(info); },
-        // 播放器自己发现没法播（比如谱里一个音都没有）时用它报一句
-        onWarn: function (m) { status(m); },
-        onState: function (on) {
-          ST.playing = !!on;
-          var b = $('#ed-play');
-          if (b) b.textContent = on ? '暂停' : '播放';
-          // 暂停不再把选中格挪到红杠上（用户 2026-10-25：选中列别跟着红杠跑）
-          paint();
-          paintNow();
-        }
-      });
-    }
     if (!ST.pad && window.SkyPad) {
       ST.pad = new SkyPad($('#ed-pad'), function (i) { padTap(i); });
       ST.pad.bindKeys();
