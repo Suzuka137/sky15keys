@@ -222,10 +222,15 @@ def trim_silence(y, sr, thresh_db=-45.0, pad=0.05, min_head=0.20, floor_margin=8
     """裁掉首尾静音（20ms 帧 RMS）。
 
     阈值取两者里更高的那个：相对峰值的 `thresh_db`（默认 −45dB），
-    以及**噪声底 + `floor_margin`**（底噪用帧 RMS 的 10% 分位估计）。
+    以及**噪声底 + `floor_margin`**（底噪用帧 RMS 的 **2% 分位**估计）。
     只看绝对阈值在真实录音上会失效 —— 底噪一旦高于 −45dB（手机录、18dB SNR、
     mild/heavy 降质），整首都判成"有声"，一秒也裁不掉，引导静音的相位错还在。
     实测：站点音频 + 18dB 噪声，纯峰值阈值裁不动、F1 70.2；加噪声底判据后修好。
+
+    **为什么是 2% 不是 10%**：10% 分位在「前奏轻、高潮响」的曲子上会被前奏顶高，
+    整段前奏会被当成静音裁掉（2026-10-25 用户报视频前 30 秒的音全没了，实测那段
+    10% 分位 −32.2dB、峰值 −11.2dB → 阈值 −24.2dB → 裁掉 28.47 秒；换 2% 分位后
+    阈值 −40dB → 只裁开头 4.56 秒的真静音）。
 
     为什么必须有：真实录音/站点回放音频经常带 3~6 秒引导静音，
     而 `beats.select_grid` 的相位是相对**录音起点**算的 —— 头上多 6 秒，
@@ -249,7 +254,13 @@ def trim_silence(y, sr, thresh_db=-45.0, pad=0.05, min_head=0.20, floor_margin=8
     rms = np.sqrt(np.mean(y[: n * fl].reshape(n, fl) ** 2, axis=1) + 1e-12)
     db = 20.0 * np.log10(rms + 1e-12)
     peak_db = float(db.max())
-    floor_db = float(np.percentile(db, 10))
+    # 噪声底用 2% 分位，不是 10% —— 10% 分位在「前奏很轻、高潮很响」的曲子会被前奏
+    # 顶得很高，于是整段前奏被判成静音裁掉（2026-10-25 用户报：视频前 30 秒的音全没了。
+    # 那段实测 10% 分位 -32.2dB、峰值 -11.2dB，阈值算出 -24.2dB，前奏全在阈值以下，
+    # 裁掉 28.47 秒；换 2% 分位（-48dB）后阈值 -40dB，只裁掉开头 4.56 秒的真静音）。
+    floor_db = float(np.percentile(db, 2))
+    # 兜底：底噪不可能比峰值低 40dB 以上，再低就是数字静音了（别让 2% 分位被空段拉穿）
+    floor_db = max(floor_db, peak_db - 40.0)
     thr_db = max(peak_db + thresh_db, floor_db + floor_margin)
     thr_db = min(thr_db, peak_db - 6.0)      # 兜底：别把整首都判成静音
     idx = np.nonzero(db > thr_db)[0]
@@ -286,7 +297,7 @@ def _piano(wav, device=None, onset=None, offset=None, frame=None, pedal=None,
 
 
 def _transkun(wav, device=None, trim=True, **kw):
-    """Transkun 2.0（MIT，Yujia Yan）—— 公开的钢琴转录模型，实测在**真实音色**上更强。
+    """Transkun 2.0（MIT，Yujia Yan）—— 西西乐谱后端同款，实测在**真实音色**上更强。
 
     为什么默认不用它：48 首基准的音频是 `tools/render_midi` 的加法合成音，
     在这个"不像钢琴"的输入上 Transkun 只有 76%，字节 95%；但把音频换成
