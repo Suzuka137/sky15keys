@@ -58,6 +58,11 @@
 
   /* ---------- 音频上下文 ---------- */
   Player.prototype.ensure = function () {
+    /* ctx 会被浏览器关掉（标签页休眠久了、系统回收音频设备），之后再用它
+       createBufferSource 会抛 InvalidStateError。那一下如果发生在 play() 里，
+       playing 已经置成 true，就再也不会自己变回来 —— 表现就是「怎么点都没反应」。
+       所以发现 closed 就丢掉重建（2026-10-25 用户报的）。 */
+    if (this.ctx && this.ctx.state === 'closed') { this.ctx = null; this.bus = null; }
     if (this.ctx) return this.ctx;
     var AC = window.AudioContext || window.webkitAudioContext;
     this.ctx = new AC({ latencyHint: 'interactive' });
@@ -258,7 +263,10 @@
   };
 
   Player.prototype.play = function () {
-    if (!this.slots.length) return;
+    if (!this.slots.length) {
+      if (this.onWarn) this.onWarn('这份谱里一个音都没有，没得播。');
+      return;
+    }
     var ctx = this.resume();
     if (this.playing) return;
     var range = this.loopRange();
@@ -267,9 +275,20 @@
     this.nextTime = ctx.currentTime + 0.08;
     this.playing = true;
     var self = this;
-    this._pump();
-    this.timer = setInterval(function () { self._pump(); self._tick(); }, TICK_MS);
-    this._frame();
+    /* 起播这一段必须能回滚：_pump 里要 createBufferSource / createGain，
+       音频设备被回收时会抛。抛了却不把 playing 改回 false，下一次 toggle()
+       就会走进 pause()，用户看到的就是「按了没反应」而且再也恢复不了
+       （2026-10-25 用户报的）。 */
+    try {
+      this._pump();
+      this.timer = setInterval(function () { self._pump(); self._tick(); }, TICK_MS);
+      this._frame();
+    } catch (e) {
+      this.playing = false;
+      if (this.timer) { clearInterval(this.timer); this.timer = 0; }
+      if (this.raf) { cancelAnimationFrame(this.raf); this.raf = 0; }
+      throw e;
+    }
     this.onState(true);
   };
 

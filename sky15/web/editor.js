@@ -114,6 +114,12 @@
     if (box) box.textContent = '出错了：' + (e && e.message ? e.message : e);
   }
 
+  /* 只往状态栏写一句，不加「出错了：」前缀、不抛 —— 播放这类可以重试的操作用它报原因。 */
+  function status(msg) {
+    var box = $('#ed-now');
+    if (box) box.textContent = msg;
+  }
+
   /* ---------------- DOM ---------------- */
   function build() {
     if ($('#ed')) { ST.el = $('#ed'); wire(); return; }
@@ -215,6 +221,8 @@
     if (!ST.player && window.SkyPlayer) {
       ST.player = new SkyPlayer({
         onTick: function (info) { onTick(info); },
+        // 播放器自己发现没法播（比如谱里一个音都没有）时用它报一句
+        onWarn: function (m) { status(m); },
         onState: function (on) {
           ST.playing = !!on;
           var b = $('#ed-play');
@@ -677,14 +685,23 @@
   }
 
   function togglePlay() {
-    if (!ST.player) return;
+    if (!ST.player) { status('播放器还没准备好，等一下再点。'); return; }
     var was = ST.playing;
-    refreshPlayer();
-    if (!was) {
-      // 续播：从暂停时停下的那一格接着放；想从选中列开始要按 E（用户 2026-10-25）
-      try { ST.player.seek(ST.phSlot); } catch (e) { }
+    /* 这一串任何一处抛（音频设备被浏览器回收、谱面数据异常），异常都会冒到
+       事件处理器里被浏览器吞掉，用户看到的就是「按空格、点播放完全没反应」。
+       兜住它，至少把原因写到状态栏（2026-10-25 用户报的）。 */
+    try {
+      refreshPlayer();
+      if (!was) {
+        // 续播：从暂停时停下的那一格接着放；想从选中列开始要按 E（用户 2026-10-25）
+        try { ST.player.seek(ST.phSlot); } catch (e) { }
+      }
+      ST.player.toggle();
+    } catch (e) {
+      try { console.error(e); } catch (e2) { }
+      status('播放出错了：' + ((e && e.message) ? e.message : e)
+        + '　点一下页面再试，还不行就刷新一下。');
     }
-    ST.player.toggle();
   }
 
   function seekSlot(s) {
