@@ -98,30 +98,46 @@ def pick_key_detail(events, mode="fit"):
     music21。归一化用「每音的领先分」（margin / 事件数），阈值 0.05：
     实测要听 external 的两首是 0.006 / 0.029，不该听的是 0.096~0.29。
     """
-    best, best_score = None, None
-    second = None
+    import statistics
+
+    med = statistics.median(e["pitch"] for e in events) if (mode == "low" and events) else 0.0
+    scored = []
     for k in layout.KEYS:
         inr = 0
         err = 0.0
+        root_hits = 0
+        root_pc = layout.KEY_MIDI[k] % 12
         for e in events:
             c, d = layout.snap(e["pitch"], k)
             if abs(d) == 0:
                 inr += 1
             err += abs(d)
+            if int(e["pitch"]) % 12 == root_pc:
+                root_hits += 1
         if mode == "inr":
             score = inr
         elif mode == "low":
-            import statistics
-            med = statistics.median(e["pitch"] for e in events)
             score = inr * 2 - err - abs((med - layout.KEY_MIDI[k]) - 12) * 0.5
         else:
             score = inr * 2 - err
-        if best_score is None or score > best_score:
-            best, second, best_score = k, best_score, score
-        elif second is None or score > second:
-            second = score
+        scored.append((score, k, root_hits))
+
+    # 平局不能按 KEYS 的字母序取第一个：E 排在 B 前面，于是「B 调但只认出 5 个音」
+    # 会判成 E（2026-10-25 用户报：B 调、C 调两首出来都是 E）。三级判据：
+    #   ① 主音出现次数多（真调的主音几乎一定出现，属调/关系调不会）
+    #   ② 最低音离该调根音近（旋律最低音通常是主音或属音，不会离根音很远）
+    #   ③ 最后才退回 KEYS 顺序
+    low_pc = (int(min(e["pitch"] for e in events)) % 12) if events else 0
+    scored.sort(key=lambda s: (
+        -s[0], -s[2],
+        min((low_pc - layout.KEY_MIDI[s[1]] % 12) % 12,
+            (layout.KEY_MIDI[s[1]] % 12 - low_pc) % 12),
+        layout.KEYS.index(s[1]),
+    ))
+    best, best_score = scored[0][1], scored[0][0]
+    second = scored[1][0] if len(scored) > 1 else best_score - 1e9
     n = max(1, len(events))
-    margin = (best_score - (second if second is not None else best_score - 1e9)) / n
+    margin = (best_score - second) / n
     return best, margin
 
 
