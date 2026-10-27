@@ -10,7 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from sky15 import layout, smc, arrange
 
 CORPUS_ENV = "SKY15_SMC_CORPUS"
-DEFAULT_CORPUS = pathlib.Path(__file__).resolve().parent.parent / "ccyuepu" / "exports" / "smc"
+DEFAULT_CORPUS = pathlib.Path(__file__).resolve().parent.parent / "corpus" / "smc"
 
 
 def smc_to_events(text):
@@ -33,7 +33,7 @@ def main(root=None):
         return 0
     root = root or os.environ["SKY15_TRUTH"]
 
-    # 语料默认和工程同级（ccyuepu/exports/smc）。别写死本机绝对路径：
+    # 语料默认和工程同级（corpus/smc）。别写死本机绝对路径：
     # 换台机器或换个盘符就找不到，而找不到时以前是静默 return 0 ——
     # accept 那边靠 "81" 这个词就能通过，等于这道闸门从没验过。
     root = root or os.environ.get(CORPUS_ENV) or str(DEFAULT_CORPUS)

@@ -8,7 +8,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 #: 语料目录（发布副本不带语料，找不到就跳过往返用例）
 CORPUS_ENV = "SKY15_CORPUS"
-DEFAULT_CORPUS = HERE.parent / "ccyuepu" / "offline" / "scores"
+DEFAULT_CORPUS = HERE.parent.parent / "corpus" / "scores"
 
 
 def test_sort_chars_high_first():
@@ -68,7 +68,7 @@ def test_set_chars_keeps_marker():
 def test_roundtrip_text():
     """语料里每一首：拆开再拼回去，格子内容和小节线位置必须一模一样。
 
-    语料目录默认 ./ccyuepu/offline/scores，可用 SKY15_CORPUS 指定；
+    语料目录可用 SKY15_CORPUS 指定（默认 ./corpus/scores）；
     发布副本不带语料，找不到就跳过，不算失败。
     """
     root = pathlib.Path(os.environ.get(CORPUS_ENV) or DEFAULT_CORPUS)

@@ -297,7 +297,7 @@ def _piano(wav, device=None, onset=None, offset=None, frame=None, pedal=None,
 
 
 def _transkun(wav, device=None, trim=True, **kw):
-    """Transkun 2.0（MIT，Yujia Yan）—— 西西乐谱后端同款，实测在**真实音色**上更强。
+    """Transkun 2.0（MIT，Yujia Yan）—— 实测在**真实音色**上更强。
 
     为什么默认不用它：48 首基准的音频是 `tools/render_midi` 的加法合成音，
     在这个"不像钢琴"的输入上 Transkun 只有 76%，字节 95%；但把音频换成

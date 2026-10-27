@@ -33,8 +33,6 @@ python -m sky15.tools.make_samples sky15/web/samples
 | numpy | BSD-3-Clause | |
 | mido | MIT | |
 | music21 | BSD-3-Clause | 用于调性分析 |
-| homr | Apache-2.0 | **可选**，图片识谱用；以 pip 包安装，权重由 `homr --init` 下载 |
-| Audiveris | AGPL-3.0 | 旧识谱后端，已不在默认流程里；本仓库不分发也不链接它 |
 | ffmpeg | LGPL-2.1+ / GPL（看构建） | 外部命令行工具 |
 
 ## 关于游戏与格式

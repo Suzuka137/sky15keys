@@ -9,7 +9,6 @@
 ```
 pip install -r requirements.txt
 python -m sky15.cli audio 你的录音.mp3 -o out/demo.smc
-python -m sky15.cli omr   你的五线谱.png -o out/demo.smc   # 需要 homr
 ```
 
 跑完会得到一份 `.smc` 文本，`python sky15/web/server.py` 能看界面、听声音、导出图片。
@@ -18,7 +17,6 @@ python -m sky15.cli omr   你的五线谱.png -o out/demo.smc   # 需要 homr
 
 ```
 python -m sky15.test_musicxml      # 36 条，纯逻辑，秒级
-python -m sky15.test_omr           # 11 条，需要 homr
 python -m sky15.test_timewarp      # 5 条，变速对位
 ```
 

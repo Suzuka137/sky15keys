@@ -33,10 +33,7 @@ RELEASE = 0.30                 # 松键释放时间（秒）
 TAIL_PAD = 1.2                 # 结尾留的自然衰减
 CACHE_BYTES = 96 * 1024 * 1024  # 解码缓存上限
 
-SALAMANDER = os.environ.get(
-    "SKY15_SALAMANDER",
-    r"E:\ai\workspace\sky15\out\salamander\SalamanderGrandPianoV3_OggVorbis",
-)
+SALAMANDER = os.environ.get("SKY15_SALAMANDER", "")
 FALLBACK = os.environ.get(
     "SKY15_PIANO_SAMPLES",
     str(pathlib.Path(__file__).with_name("web") / "samples"),

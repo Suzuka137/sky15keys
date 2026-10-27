@@ -720,7 +720,7 @@ def _piano_audio(text: str, jid: str = "", src_events=None,
 def _fill_gaps(ev, min_gap: float = 0.12, max_hold: float = 2.0):
     """把音延长到下一个音起头，补掉谱面上的空洞。
 
-    为什么需要：图片识谱会把一半的音认丢，漏掉的音就变成空拍，
+    为什么需要：导出来的 MusicXML 常常缺音，漏掉的音就变成空拍，
     直接弹出来就是「断断续续」。这里是**听感修补**，不改变谱面本身，
     只在渲染音频时让上一个音继续响着，听起来像连奏。
     """
@@ -1689,13 +1689,13 @@ class App(SimpleHTTPRequestHandler):
                                  time_sig=meta.get("time_sig") or "4/4")
             return self._bytes(data, "audio/midi", base + ".mid", inline=False)
         if mode == "piano":
-            # 谱面是从 MusicXML / 图片识谱来的，就弹原谱的每一个音（不经过 15 键压缩）；
+            # 谱面是从 MusicXML 来的，就弹原谱的每一个音（不经过 15 键压缩）；
             # 从音频来的或已经是 15 键谱，就弹屏幕上这份。
             src = (job or {}).get("_src_seconds")
             want = (self._q1(q, "src", "") or "").lower()
             if want == "keys":
                 src = None
-            # 图片识谱会把音认丢，谱面上一半是空拍，直接弹就是断断续续。
+            # MusicXML 常缺音，谱面上一半是空拍，直接弹就是断断续续。
             # 这类曲子默认按连奏补洞（只影响音频，不动谱面），?legato=0 可关。
             lg = (self._q1(q, "legato", "") or "").lower()
             kind = (job or {}).get("kind") or ""
@@ -1774,7 +1774,7 @@ class App(SimpleHTTPRequestHandler):
         if ext in SHEET_EXT:
             kind = "score"
         elif ext in IMAGE_EXT:
-            # 图片/PDF 识谱已经整块删掉了（用户 2026-10-27 定：用不上）。
+            # 图片/PDF 识谱在 1.0 里整块删掉了。
             # 保留这个分支只为把话说清楚 —— 别让它掉进下面的 ffmpeg 分支，
             # 那会报「音频解码失败」，用户会以为文件坏了。
             raise HumanError("五线谱图片/PDF 的识别功能已经删了。",
@@ -1814,7 +1814,7 @@ class App(SimpleHTTPRequestHandler):
             if "曲谱" not in smc_text:
                 raise HumanError("这个谱面文件里没有「曲谱:」这一段，不是 15 键谱。",
                                  advice=["用记事本打开能看到 曲名:[...] 速度:[...] 曲谱:[...] 才对。",
-                                         "如果你拖的是五线谱图片，那要走识谱，不是这条。"])
+                                         "五线谱图片不再支持识别，请先在 MuseScore 里导出 MusicXML。"])
         job = new_job(kind, name=name, source=name, params=params)
         jid = job["id"]
         try:

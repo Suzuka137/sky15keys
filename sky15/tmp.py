@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """项目自己的临时目录：**不放 C 盘**。
 
-系统 temp 在 C 盘（`%LOCALAPPDATA%\\Temp`），识谱/转谱一次会扔好几 MB 进去，
+系统 temp 在 C 盘（`%LOCALAPPDATA%\\Temp`），转谱/出图一次会扔好几 MB 进去，
 跑一晚上能攒出几百 MB 的历史残留（2026-10-24 实测 547 个目录 / 351 MB，全是
 `tempfile.mkdtemp()` 留下的，没人清）。这里统一收到 `sky15/out/tmp/`，并在每次
 新建时顺手清掉 3 天前的，永远不往 C 盘长。

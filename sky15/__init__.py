@@ -18,6 +18,6 @@
     web/        本地网页界面（stdlib，无框架）
 """
 
-__version__ = "0.3.0"
+__version__ = "1.0.0"
 __all__ = ["layout", "smc", "transcribe", "beats", "arrange", "musicxml",
            "render", "pianorender", "audioq"]
