@@ -163,35 +163,6 @@ def cmd_musicxml(a):
         publish.publish(a.output, title=a.title or None)
 
 
-def cmd_omr(a):
-    """五线谱图片/PDF → OMR → MusicXML → 15 键谱"""
-    from . import omr
-    if not omr.available():
-        print("找不到 Audiveris。装法：")
-        print("  1) 下 https://github.com/audiveris/audiveris/releases 里")
-        print("     Audiveris-x.y.z-windowsConsole-x86_64.msi（自带 Java）")
-        print("  2) 或设环境变量 SKY15_AUDIVERIS 指向可执行文件")
-        return
-    print(f"用 {omr.find_audiveris()}")
-    print("识别中（图片越大越慢，几分钟正常）…")
-    mx = omr.to_musicxml(a.input, outdir=a.workdir, timeout=a.timeout)
-    print(f"  MusicXML：{mx}")
-    from . import musicxml
-    got = musicxml.parse_full(mx)
-    ev, tempo, ts, key = got.events, got.tempo, got.time_sig, got.key
-    print(f"  音符 {len(ev)}，{tempo} BPM，{ts}，调 {key}")
-    if got.tempo_map and len(got.tempo_map) > 1:
-        print(f"  变速：{got.describe_tempo()}")
-    use_tempo = a.tempo or tempo
-    secs = musicxml.to_seconds(ev, use_tempo) if a.tempo else got.to_seconds()
-    out = arrange.arrange(secs, tempo=use_tempo,
-                          time_sig=a.time_sig or ts,
-                          key=a.key or key, title=a.title or
-                          os.path.splitext(os.path.basename(a.input))[0],
-                          max_notes=a.max_notes)
-    _write(out, a.output)
-
-
 def cmd_batch(a):
     """整个文件夹批量转：音频/视频都收，一个个出谱，可顺手存进本地曲库"""
     import pathlib
@@ -336,17 +307,6 @@ def cmd_doctor(a):
     except Exception:                                         # noqa: BLE001
         pass
 
-    # ---- 识谱
-    try:
-        from . import omr
-        av = omr.find_audiveris()
-        print("Audiveris", av or "未找到（只有「五线谱图片」输入需要它）")
-        if not av:
-            warn.append("没有 Audiveris：传图片/PDF 会失败；MusicXML 输入不受影响。"
-                        "下载：https://github.com/Audiveris/audiveris/releases")
-    except Exception:                                         # noqa: BLE001
-        pass
-
     # ---- 音色
     try:
         from . import siteplay
@@ -444,18 +404,6 @@ def main(argv=None):
     mx.add_argument("--max-notes", dest="max_notes", type=int, default=3)
     mx.add_argument("--publish", action="store_true")
     mx.set_defaults(func=cmd_musicxml)
-
-    om = sub.add_parser("omr", help="五线谱图片/PDF → SMC（要 Audiveris）")
-    om.add_argument("input")
-    om.add_argument("-o", "--output", required=True)
-    om.add_argument("--workdir", default=None, help="中间产物目录")
-    om.add_argument("--timeout", type=int, default=600)
-    om.add_argument("--key", default=None)
-    om.add_argument("--tempo", type=int, default=None)
-    om.add_argument("--time-sig", dest="time_sig", default=None)
-    om.add_argument("--title", default="")
-    om.add_argument("--max-notes", dest="max_notes", type=int, default=3)
-    om.set_defaults(func=cmd_omr)
 
     a = p.parse_args(argv)
     # 以前这里没有 return，`__main__.py` 的 sys.exit(main()) 拿到 None = 退出码恒 0，

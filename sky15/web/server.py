@@ -152,8 +152,6 @@ STAGES = {
               ("arrange", "重排"), ("render", "出谱")],
     "score": [("read", "读五线谱"), ("tempo", "定速"), ("arrange", "重排"),
               ("render", "出谱")],
-    "omr": [("omr", "识别谱面"), ("read", "解析音符"), ("tempo", "定速"),
-            ("arrange", "重排"), ("render", "出谱")],
     "smc": [("read", "读谱面"), ("render", "出谱")],
 }
 
@@ -304,14 +302,11 @@ def _public(job) -> dict:
         d = dict(job)
     t0 = d.pop("_t0", None)
     aq = d.get("_audioq")
-    dbg = d.get("_omr_debug")
     for k in [k for k in list(d) if k.startswith("_")]:
         d.pop(k, None)
     if aq:
         # 录音体检结果在转谱阶段就能拿到，先给前端，别等任务结束
         d["quality"] = aq
-    if dbg:
-        d["omr_debug"] = f"/api/omrdebug/{d.get('id')}"
     if t0 and d.get("status") in ("queued", "running"):
         d["elapsed"] = round(time.time() - t0, 1)
     d.setdefault("elapsed", 0.0)
@@ -441,21 +436,6 @@ def _advice_for(res: dict) -> list:
                     "text": "这是直接打开的现成谱面，没经过转谱。改速度、调性、和弦都能直接重算。",
                     "action": ""})
     cover = res.get("cover")
-    if kind == "omr" and isinstance(cover, (int, float)) and cover < 0.72:
-        out.append({
-            "level": "warn",
-            "text": f"这张图识谱只认出了 {int(cover*100)}% 的时间有音，"
-                    f"剩下全是它读出来的空拍——所以听着断断续续、也不像原曲。"
-                    f"这不是 15 键压掉的问题，是识谱本身漏了音：拍号/调号可能读错，"
-                    f"弱起的音和跨行的连音也容易丢。",
-            "action": "file",
-        })
-        out.append({
-            "level": "info",
-            "text": "想要能听的效果，用打谱软件（MuseScore、Sibelius、Finale 都行）"
-                    "把这份谱子导出成 MusicXML 再拖进来——同一个引擎，音一个不丢。",
-            "action": "",
-        })
     aq = res.get("audioq") or {}
     if kind == "audio" and aq.get("ok"):
         if aq.get("level") == "bad":
@@ -1076,8 +1056,6 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
         _stage(job, "arrange", 1.0)
         if job.get("_via_audio") and not job["_via_audio"].get("fallback"):
             grid = f"{grid} · 先弹钢琴音频再转谱"
-        if job.get("_omr_note"):
-            grid = f"{grid} · {job['_omr_note']}"
         _finish(job, text, backend=backend_name,
                 extra={"confidence": conf, "hit": 100, "grid": grid,
                        "doubled": int(why.get("doubled") or 0),
@@ -1156,8 +1134,6 @@ def _arrange_from_events(job, events, opts, *, backend_name, bpm_guess=None,
     via = job.get("_via_audio") or {}
     if via and not via.get("fallback"):
         grid = f"{grid} · 先弹钢琴音频再转谱"
-    if job.get("_omr_note"):
-        grid = f"{grid} · {job['_omr_note']}"
     _finish(job, text, backend=backend_name,
             extra={"confidence": conf, "hit": int(round(hit * 100)),
                    "grid": grid, "doubled": doubled,
@@ -1401,197 +1377,6 @@ def _run_score(job):
                    "score_warnings": len(getattr(parsed, "warnings", []) or [])})
 
 
-def _run_omr(job):
-    OM, MX, A = mod("omr"), mod("musicxml"), mod("arrange")
-    path = job["_payload"]["path"]
-    opts = job["params"]
-    _stage(job, "omr", 0.05)
-    _ck(job)
-    try:
-        ok = OM.available() or OM.homr_available()
-    except Exception:
-        ok = False
-    if not ok:
-        raise HumanError("这台机器上没找到识谱引擎，五线谱图片认不了。",
-                         advice=["装 homr 或 Audiveris（都是开源的五线谱识别工具）后重开界面；",
-                                 "或者用打谱软件导出 MusicXML，直接拖 .musicxml 进来——更快也更准；",
-                                 "实在只有图片，就手动对着图片把音高敲进 15 键面板。"],
-                         code="no_omr")
-    try:
-        # homr 先跑（6~8 秒，拍号读得准）；它读得干净就直接用，否则再拿
-        # Audiveris 按几档放大跑一遍取最优。Audiveris 对分辨率不是「越大越好」，
-        # 实测同一页 1× 出 317 音/覆盖 99.5%，2× 只剩 231 音/覆盖 71.6%。
-        _stage(job, "omr", 0.15, note="选引擎")
-        _best_args = dict(keep_debug=True,
-                          on_step=lambda msg, info: _stage(job, "omr", 0.3, note=msg))
-        try:
-            made, omr_best = OM.to_musicxml_best(path, **_best_args)
-        except Exception as first:
-            # homr 偶尔会失败一次（进程/临时目录竞争），同一张图第二次就好了。
-            # 实测用户上传《一梦繁唐》第一次报「这张图不是五线谱」，重传立刻 230 音。
-            # 所以崩了先自己重跑一遍，别把引擎的偶发故障说成"你的图不是五线谱"。
-            log(f"识谱第一次失败，重试一次：{first}")
-            _stage(job, "omr", 0.15, note="重试")
-            made, omr_best = OM.to_musicxml_best(path, **_best_args)
-    except Exception as e:
-        tail = str(e).strip().splitlines()
-        tail = next((x for x in reversed(tail) if x.strip()), "")
-        # 把引擎的崩溃堆栈原样甩给用户没用（只有半行 `process_image(args.image`），
-        # 真正有用的信息是「它没在这张图上找到谱表」——最常见的原因就是：
-        # 这不是五线谱，而是 15 键数字谱截图（Sky Studio 那种），或者是照片/斜拍。
-        low = (str(e) + " " + tail).lower()
-        # 只说「图上没有谱表」的那几句话，才能断言"不是五线谱"。
-        # 以前这里还匹配 `staff` / `traceback` / `process_image` / `xml_gene` ——
-        # 那些是引擎的栈帧名，磁盘满、权限、临时目录竞争崩掉时也会出现，
-        # 于是"引擎挂了"被说成"你的图不是五线谱"，用户白重拍一张其实没问题的谱。
-        no_staff = ("no regularly spaced lines" in low
-                    or "no staff" in low or "staff not found" in low
-                    or "no staves" in low or "没有谱表" in low
-                    or "homr 跑完了但没出" in low)
-        if no_staff:
-            raise HumanError(
-                "这张图里没找到五线谱的谱表，认不了。",
-                advice=["图片只认五线谱（带五条横线的钢琴谱、歌曲谱）。"
-                        "简谱、光遇 15 键格子谱、照片里的其他东西，一律不转。",
-                        "如果它确实是五线谱，正对镜头重拍一张或者用扫描件，别斜、别压阴影。",
-                        "要把曲子转成 15 键谱，就传音频；要精确，就直接拖 MusicXML。"],
-                code="not_score_image") from e
-        raise HumanError("识谱引擎这次没跑通 —— 不是图不对，是引擎自己出错了。",
-                         advice=["先重试一次：这类失败多是临时目录/进程竞争，第二次通常就好了；",
-                                 "还不行就换一张图；要精确就直接用打谱软件导出 MusicXML 拖进来，"
-                                 "比识图又快又准。",
-                                 f"引擎原话：{tail[:200]}"],
-                         code="omr_failed") from e
-    job["_omr_best"] = omr_best
-    if omr_best.get("debug_notes"):
-        job["_omr_debug"] = omr_best["debug_notes"]
-    _stage(job, "omr", 1.0)
-    _ck(job)
-
-    if isinstance(made, (list, tuple)):
-        made = made[0] if made else None
-    if not made:
-        raise HumanError("识别跑完了但没产出谱面文件。",
-                         advice=["换一张更清晰的图片再试。"])
-    _stage(job, "read", 0.3)
-    _ck(job)
-    parsed = MX.parse_full(str(made))
-    events, tempo_file, time_sig, _key = (
-        parsed.events, parsed.tempo, parsed.time_sig, parsed.key)
-    if not events:
-        # 走到这里说明引擎**成功吐了 MusicXML**，只是我们没从里面读出音符。
-        # 那可能是谱面真的空（整页休止），也可能是解析器跟不上某个写法 ——
-        # 这两种都不该说成"你的图不是五线谱"。
-        raise HumanError("识谱跑完了，也生成了谱面文件，但从里面没读出任何音符。",
-                         advice=["先重试一次；两次都一样就说明这张谱的写法我们没吃透。",
-                                 "改用 MusicXML 最省事：用 MuseScore 之类打谱软件打开这首曲子、"
-                                 "导出 .musicxml 再拖进来。",
-                                 f"（引擎产出的文件：{str(made)[:180]}）"],
-                         code="omr_empty")
-    # 兜底：homr 偶尔会在非五线谱的图上"成功"吐出几个音（照片、插图、稀疏的谱页边角）。
-    # 五线谱真实谱页实测最少也有上百个音；这里按「少得不像谱」判，宁可挡住也不给假谱。
-    try:
-        _ps = [int(e.get("pitch") or e.get("midi") or 0) for e in events]
-        _ps = [x for x in _ps if x]
-        if len(events) < 8 or len(set(_ps)) < 3 or (max(_ps) - min(_ps) < 5):
-            raise HumanError(
-                "这张图里只认出几个音，不像五线谱。",
-                advice=["图片只认五线谱；简谱、15 键格子谱、插画、照片一律不转。",
-                        "换一张清晰、正对镜头的五线谱再试。",
-                        f"（这次只认出 {len(events)} 个音、{len(set(_ps))} 种音高）"],
-                code="not_score_image")
-    except HumanError:
-        raise
-    except Exception as exc:
-        log(f"谱面合理性检查跳过：{exc}")
-    _stage(job, "read", 1.0)
-    _stage(job, "tempo", 1.0)
-    _ck(job)
-
-    time_sig = time_sig or "4/4"
-    want = _int_or_none(opts.get("tempo"))
-    warp = None
-    if want:
-        tempo_grid = float(_clamp(want, 20, 400))
-        tempo = tempo_grid * _bar_quarters(time_sig) / 4.0
-        secs = MX.to_seconds(events, tempo)
-        grid_note = f"手动 {int(tempo_grid)} BPM"
-    else:
-        tempo = int(_clamp(_int_or_none(tempo_file) or 120, 20, 400))
-        tempo_grid = _grid_tempo(tempo, time_sig)
-        secs = parsed.to_seconds()
-        grid_note = _tempo_note(parsed, tempo)
-        grid_note += _grid_tail(tempo, tempo_grid, time_sig)
-        tmap = list(getattr(parsed, "tempo_map", None) or [])
-        if len({round(float(b), 3) for _p, b in tmap}) > 1:
-            try:
-                sem = mod("score_semantics")
-                warp = (lambda tm: (lambda t: sem.seconds_to_slots(t, tm)))(tmap)
-                grid_note += " · 跟随谱面变速"
-            except Exception as exc:
-                log(f"变速映射建不起来，按固定速度出谱：{exc}")
-    tempo = int(round(tempo_grid))
-    # 同 _run_score：十六分格默认关（用户 2026-10-23 听过 A/B 后裁定不用）。
-    AUTO_DOUBLE_GRID = False
-    if AUTO_DOUBLE_GRID and not want and warp is None:
-        try:
-            gmod = mod("grid")
-            factor, ginfo = gmod.choose_factor(secs, tempo)
-            if factor > 1:
-                tempo, time_sig = gmod.apply_factor(tempo, factor, time_sig)
-                grid_note += f" · 十六分格（速度 ×{factor}）"
-                print(f"格子翻倍：{ginfo.get('why')}", flush=True)
-        except Exception as exc:
-            print(f"格子判定跳过：{exc}", flush=True)
-    key = (opts.get("key") or "").strip() or None
-    if key and key not in layout.KEY_MIDI:
-        key = None
-    _stage(job, "arrange", 0.4)
-    _ck(job)
-    job["_src_seconds"] = secs          # 同 _run_score：钢琴声用原谱
-    cover = _coverage(secs)
-    best = job.get("_omr_best") or {}
-    _eng = {"homr": "homr", "audiveris": "Audiveris"}.get(best.get("engine"), "")
-    _n = len(best.get("tries") or [])
-    _eng_note = ""
-    grid_base = grid_note          # 不带"识谱 homr"的那半句，_arrange_from_events 自己会接
-    if _eng:
-        _eng_note = f" · 识谱 {_eng}" + (f"（{_n} 档取最优）" if _n > 1 else "")
-        grid_note += _eng_note
-
-    # 同 _run_score：默认先弹成钢琴音频再转谱。识谱读出来的钢琴谱同时音最多
-    # 9 个，15 键一格只放得下 3 个，直排等于硬砍；过一遍模型会按听感挑音。
-    if _bool(opts.get("via_audio"), True):
-        try:
-            ev2, _bk = _sheet_to_audio_events(job, secs)
-            # 下面 _arrange_from_events 会自己接"· 先弹钢琴音频再转谱 · <_omr_note>"，
-            # 所以这里只把"识谱某某"这一节交给它，否则整句会重复一遍。
-            job["_omr_note"] = _eng_note.lstrip(" ·")
-            return _arrange_from_events(job, ev2, opts, backend_name=_bk,
-                                        fixed_tempo=tempo, fixed_ts=time_sig, fixed_note=grid_base)
-        except Exception as exc:
-            log(f"谱面→钢琴音频这条路失败，回退直排：{exc}")
-            job["_via_audio"] = {"fallback": f"{type(exc).__name__}: {exc}"[:160]}
-
-    text = A.arrange(secs, tempo=tempo, time_sig=time_sig, key=key,
-                     title=_pretty_title(job.get("name") or ""), offset=0.0,
-                     warp=warp,
-                     harmony=_bool(opts.get("harmony"), True),
-                     max_notes=_clamp(_int_or_none(opts.get("max_notes")) or 3, 1, 3),
-                     hand_split="auto", chord_mode=_chord_mode(opts.get("chords")))
-    job["_cache"] = {"timebase": "beats", "events": events, "tempo": tempo,
-                     "time_sig": time_sig,
-                     "tempo_map": list(getattr(parsed, "tempo_map", None) or [])}
-    job["params"] = dict(opts, tempo=tempo, key=key or "", backend=_eng or "audiveris",
-                         confidence="手动", hit=100, grid=grid_note)
-    _stage(job, "arrange", 1.0)
-    _finish(job, text, backend=_eng or "audiveris",
-            extra={"confidence": "手动", "hit": 100, "grid": grid_note,
-                   "doubled": 0, "source_tempo": _int_or_none(tempo_file),
-                   "cover": round(cover, 3),
-                   "omr_tries": best.get("tries") or []})
-
-
 def _run_smc(job):
     text = job["_payload"]["text"]
     _stage(job, "read", 0.4)
@@ -1610,8 +1395,7 @@ def _run_smc(job):
                    "doubled": 0})
 
 
-_DISPATCH = {"audio": _run_audio, "score": _run_score,
-             "omr": _run_omr, "smc": _run_smc}
+_DISPATCH = {"audio": _run_audio, "score": _run_score, "smc": _run_smc}
 
 
 def _humanize(exc) -> tuple:
@@ -1622,9 +1406,6 @@ def _humanize(exc) -> tuple:
     if "ffmpeg" in low:
         return ("转谱需要 ffmpeg，本机没找到。",
                 ["winget install Gyan.FFmpeg，然后重开界面。"])
-    if "audiveris" in low:
-        return ("没找到 Audiveris，五线谱图片暂时认不了。",
-                ["装 Audiveris 后重开；或者改用 MusicXML。"])
     if "no module named" in low or "importerror" in low:
         return (f"缺少运行这个功能需要的组件：{msg}",
                 ["按 README 的安装那段把依赖装上，再重开界面。"])
@@ -1841,16 +1622,6 @@ class App(SimpleHTTPRequestHandler):
                 return self._err(404, "找不到这个任务，可能已经被清掉了。",
                                  ["重新上传一次就行；历史里的记录还能点开看。"])
             return self._json(_public(job))
-        if kind == "omrdebug":
-            job = _get_job(jid)
-            src = (job or {}).get("_omr_debug")
-            if not src or not os.path.exists(src):
-                return self._err(404, "这次没有留下识别叠图。",
-                                 ["只有用图片识谱（homr）的任务才有这张图；"
-                                  "拖音频或 MusicXML 进来的没有。"])
-            with open(src, "rb") as f:
-                data = f.read()
-            return self._bytes(data, "image/png", "识别到的音符.png", inline=True)
         if kind == "edit":
             return self._edit_get(jid, q)
         if kind in ("download", "image", "export", "info"):
@@ -1928,8 +1699,7 @@ class App(SimpleHTTPRequestHandler):
             # 这类曲子默认按连奏补洞（只影响音频，不动谱面），?legato=0 可关。
             lg = (self._q1(q, "legato", "") or "").lower()
             kind = (job or {}).get("kind") or ""
-            legato = (lg not in ("0", "off", "no")) and (
-                lg in ("1", "on", "yes") or kind == "omr")
+            legato = (lg not in ("0", "off", "no"))
             data, label = _piano_audio(text, jid, src, legato=legato)
             if legato:
                 label += "·连奏"
@@ -2004,7 +1774,14 @@ class App(SimpleHTTPRequestHandler):
         if ext in SHEET_EXT:
             kind = "score"
         elif ext in IMAGE_EXT:
-            kind = "omr"
+            # 图片/PDF 识谱已经整块删掉了（用户 2026-10-27 定：用不上）。
+            # 保留这个分支只为把话说清楚 —— 别让它掉进下面的 ffmpeg 分支，
+            # 那会报「音频解码失败」，用户会以为文件坏了。
+            raise HumanError("五线谱图片/PDF 的识别功能已经删了。",
+                             advice=["要转谱就传音频（mp3 / wav / flac / m4a）。",
+                                     "手里已经是打谱软件导出的谱，就直接拖 .musicxml / .mxl 进来。",
+                                     "手里只有图片的话，用 MuseScore 之类把音高等记一遍导成 MusicXML，"
+                                     "或者干脆对着图片把音敲进 15 键面板。"])
         elif ext in SMC_EXT:
             kind = "smc"
         elif raw[:5].lstrip().lower().startswith(b"<?xml") or raw[:2] == b"PK":

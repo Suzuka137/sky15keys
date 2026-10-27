@@ -374,8 +374,8 @@ def _collect_part(part, default_beats=None):
                         if div is None:
                             bad_divisions += 1
                         elif div < 1:
-                            # 和 omr._first_div 统一：clamp 到 1，并且说出来。
-                            # 0 会让 `duration / divisions` 要么炸要么整体错 4 倍
+                            # clamp 到 1，并且说出来。0 会让 `duration / divisions`
+                            # 要么炸要么整体错 4 倍
                             bad_divisions += 1
                             divisions = 1
                         else:

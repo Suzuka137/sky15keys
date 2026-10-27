@@ -60,9 +60,6 @@
       录音、录屏、MusicXML、还有本工具导出的 <code>.smc</code>，都能直接丢进来。
       一次拖好几个也行，会排队一个接一个转。
     </p>
-    <p class="empty-lead empty-sub">
-      图片只认<strong>五线谱</strong>（带五条横线的钢琴谱、歌曲谱）；简谱、光遇 15 键格子谱、照片一律不转。
-    </p>
     <div class="empty-actions">
       <button id="btn-pick" class="btn primary">选文件</button>
     </div>
@@ -310,7 +307,6 @@
             <a id="dl-midi" class="btn dl" download>MIDI</a>
             <a id="dl-piano" class="btn dl" download>钢琴声 MP3</a>
             <button id="btn-copy-smc" class="btn">复制文本</button>
-            <a id="dl-omrdebug" class="btn dl hidden" target="_blank" rel="noopener">看它认到了哪些音</a>
           </div>
         </div>
       </div>
@@ -343,7 +339,7 @@
 </dialog>
 
 <input id="file" type="file" multiple hidden
-       accept=".smc,.txt,.smt,.wav,.mp3,.flac,.m4a,.aac,.ogg,.opus,.wma,.mp4,.mov,.mkv,.webm,.musicxml,.xml,.mxl,.pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp">
+       accept=".smc,.txt,.smt,.wav,.mp3,.flac,.m4a,.aac,.ogg,.opus,.wma,.mp4,.mov,.mkv,.webm,.musicxml,.xml,.mxl">
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 

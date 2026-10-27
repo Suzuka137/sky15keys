@@ -5,7 +5,6 @@
 
 用法：
     python -m sky15.pianorender 谱子.musicxml
-    python -m sky15.pianorender 谱子.jpg -o 我的曲子.wav
     python -m sky15.pianorender 曲子.smc --mp3
     python -m sky15.pianorender 曲子.mid -o out --gain 0.8
 
@@ -13,7 +12,6 @@
     .musicxml / .xml / .mxl   MusicXML（MuseScore 导出）
     .mid / .midi              MIDI
     .smc / .txt               15 键谱（本站格式）
-    .png / .jpg / .pdf        五线谱图片/PDF（先过 Audiveris 识别）
 
 默认输出：与输入同名的 .wav，放在输入旁边。
 """
@@ -241,15 +239,6 @@ def events_from(path: str | pathlib.Path) -> tuple[list[dict], str]:
     if ext in (".smc", ".txt"):
         return events_from_smc_text(path.read_text(encoding="utf-8", errors="replace"))
 
-    if ext in (".png", ".jpg", ".jpeg", ".pdf", ".webp", ".bmp"):
-        from . import omr
-        if not omr.available():
-            raise RuntimeError("图片要先用 Audiveris 识别，没装的话装一下 Audiveris 5.x")
-        xml = omr.to_musicxml(str(path))
-        got = musicxml.parse_full(str(xml))
-        ev = got.to_seconds()
-        return ev, f"图片识谱（{got.tempo} BPM，{got.time_sig}，{got.key}）"
-
     raise RuntimeError(f"不认识的文件类型：{ext}")
 
 
@@ -393,7 +382,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m sky15.pianorender",
         description="五线谱 / MIDI / 15 键谱 → 钢琴音频（Salamander 真采样）")
-    ap.add_argument("src", help="谱子文件（musicxml/mxl/mid/smc/图片/pdf）")
+    ap.add_argument("src", help="谱子文件（musicxml/mxl/mid/smc）")
     ap.add_argument("-o", "--out", default=None, help="输出文件或目录，默认同名 .wav")
     ap.add_argument("--mp3", action="store_true", help="直接输出 MP3")
     ap.add_argument("--gain", type=float, default=1.0, help="整体音量倍数")

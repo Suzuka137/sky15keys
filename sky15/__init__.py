@@ -9,7 +9,6 @@
     chords      用 music21 做调性与和弦分析（可选依赖）
     melody      用 CREPE 提旋律线（可选依赖）
     musicxml    MusicXML ↔ 音符事件（含反复、连音、多声部）
-    omr         五线谱图片 → MusicXML（homr 引擎）
     grid        格子的疏密（八分 / 十六分）
     render      SMC → PNG / PDF 谱面
     siteplay    按 48 个钢琴采样把 SMC 回放成 wav（评测用）
@@ -21,4 +20,4 @@
 
 __version__ = "0.3.0"
 __all__ = ["layout", "smc", "transcribe", "beats", "arrange", "musicxml",
-           "omr", "render", "pianorender", "audioq"]
+           "render", "pianorender", "audioq"]

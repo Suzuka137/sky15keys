@@ -876,12 +876,6 @@
     $('#dl-smc').href = '/api/export/' + id + '?mode=smc' + v;
     $('#dl-midi').href = '/api/export/' + id + '?mode=midi' + v;
     if ($('#dl-piano')) $('#dl-piano').href = '/api/export/' + id + '?mode=piano&v=' + S.rev;
-    var dbg = $('#dl-omrdebug');
-    if (dbg) {
-      var hasDbg = !!(S.job && S.job.omr_debug);
-      dbg.classList.toggle('hidden', !hasDbg);
-      if (hasDbg) dbg.href = S.job.omr_debug;
-    }
     $('#dl-page').href = '/api/export/' + id + '?mode=page&page=' + S.page + '&' + expQuery() + v;
   }
 
@@ -1480,18 +1474,27 @@
       var cd = ev.clipboardData;
       if (!cd) return;
       var files = [];
+      var images = 0;
       var items = cd.items || [];
       for (var i = 0; i < items.length; i++) {
         if (items[i].kind !== 'file') continue;
         var f = items[i].getAsFile();
         if (!f) continue;
-        var ext = (f.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+        // 图片/PDF 识谱已经删掉了（2026-10-27），粘进来的截图直接说清楚，
+        // 别让它上传完再被服务端打回来。
+        if (/^image\//.test(f.type || '')) { images++; continue; }
+        var ext = (f.type.split('/')[1] || 'bin').replace('jpeg', 'jpg');
         var name = '剪贴板-' + stamp() + '.' + ext;
         try {
-          files.push(new File([f], name, { type: f.type || 'image/png' }));
+          files.push(new File([f], name, { type: f.type || 'application/octet-stream' }));
         } catch (e) {
           files.push(f);
         }
+      }
+      if (images && !files.length) {
+        ev.preventDefault();
+        toast('图片识谱的功能已经删了 —— 传音频，或者把谱子导出成 MusicXML 再拖进来', 'err');
+        return;
       }
       if (files.length) {
         ev.preventDefault();
